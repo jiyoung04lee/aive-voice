@@ -49,6 +49,38 @@ export interface RtzrTranscriptionJob {
   id: string;
 }
 
+export interface RtzrUtterance {
+  start_at: number;
+  duration: number;
+  msg: string;
+  spk: number;
+  lang: string;
+}
+
+export interface RtzrTranscribingStatus {
+  status: "transcribing";
+}
+
+export interface RtzrCompletedStatus {
+  status: "completed";
+  results: {
+    utterances: RtzrUtterance[];
+  };
+}
+
+export interface RtzrFailedStatus {
+  status: "failed";
+  error: {
+    code: string;
+    message: string;
+  };
+}
+
+export type RtzrTranscriptionStatus =
+  | RtzrTranscribingStatus
+  | RtzrCompletedStatus
+  | RtzrFailedStatus;
+
 export class RtzrConfigurationError extends Error {
   constructor(public readonly missingVariables: readonly string[]) {
     super(`필수 환경변수가 없습니다: ${missingVariables.join(", ")}`);
@@ -104,6 +136,30 @@ export class RtzrTranscriptionResponseError extends Error {
   }
 }
 
+export class RtzrTranscriptionStatusError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+  ) {
+    super(`RTZR 전사 작업 조회에 실패했습니다. (${code})`);
+    this.name = "RtzrTranscriptionStatusError";
+  }
+}
+
+export class RtzrTranscriptionStatusHttpError extends Error {
+  constructor(public readonly status: number) {
+    super(`RTZR 전사 작업 조회가 실패했습니다. (HTTP ${status})`);
+    this.name = "RtzrTranscriptionStatusHttpError";
+  }
+}
+
+export class RtzrTranscriptionStatusResponseError extends Error {
+  constructor() {
+    super("RTZR 전사 작업 조회 응답 형식이 올바르지 않습니다.");
+    this.name = "RtzrTranscriptionStatusResponseError";
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -120,6 +176,50 @@ function isRtzrTranscriptionJob(
   value: unknown,
 ): value is RtzrTranscriptionJob {
   return isRecord(value) && typeof value.id === "string" && value.id.length > 0;
+}
+
+function isRtzrUtterance(value: unknown): value is RtzrUtterance {
+  return (
+    isRecord(value) &&
+    typeof value.start_at === "number" &&
+    Number.isInteger(value.start_at) &&
+    typeof value.duration === "number" &&
+    Number.isInteger(value.duration) &&
+    typeof value.msg === "string" &&
+    typeof value.spk === "number" &&
+    Number.isInteger(value.spk) &&
+    typeof value.lang === "string"
+  );
+}
+
+function isRtzrTranscriptionStatus(
+  value: unknown,
+): value is RtzrTranscriptionStatus {
+  if (!isRecord(value) || typeof value.status !== "string") {
+    return false;
+  }
+
+  if (value.status === "transcribing") {
+    return true;
+  }
+
+  if (value.status === "completed") {
+    return (
+      isRecord(value.results) &&
+      Array.isArray(value.results.utterances) &&
+      value.results.utterances.every(isRtzrUtterance)
+    );
+  }
+
+  if (value.status === "failed") {
+    return (
+      isRecord(value.error) &&
+      typeof value.error.code === "string" &&
+      typeof value.error.message === "string"
+    );
+  }
+
+  return false;
 }
 
 function isRtzrAuthToken(value: unknown): value is RtzrAuthToken {
@@ -246,6 +346,53 @@ export async function createRtzrTranscription(
 
   if (!isRtzrTranscriptionJob(responseBody)) {
     throw new RtzrTranscriptionResponseError();
+  }
+
+  return responseBody;
+}
+
+export async function getRtzrTranscriptionStatus(
+  transcriptionId: string,
+): Promise<RtzrTranscriptionStatus> {
+  const { access_token: accessToken } = await authenticateRtzr();
+  const safeTranscriptionId = encodeURIComponent(transcriptionId);
+  const response = await fetch(
+    `${RTZR_TRANSCRIBE_URL}/${safeTranscriptionId}`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      cache: "no-store",
+    },
+  );
+
+  let responseBody: unknown;
+
+  try {
+    responseBody = await response.json();
+  } catch {
+    if (!response.ok) {
+      throw new RtzrTranscriptionStatusHttpError(response.status);
+    }
+
+    throw new RtzrTranscriptionStatusResponseError();
+  }
+
+  if (!response.ok) {
+    if (isRtzrErrorResponse(responseBody)) {
+      throw new RtzrTranscriptionStatusError(
+        response.status,
+        responseBody.code,
+      );
+    }
+
+    throw new RtzrTranscriptionStatusHttpError(response.status);
+  }
+
+  if (!isRtzrTranscriptionStatus(responseBody)) {
+    throw new RtzrTranscriptionStatusResponseError();
   }
 
   return responseBody;
