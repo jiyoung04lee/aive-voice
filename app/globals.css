@@ -1,41 +1,35 @@
 @import "tailwindcss";
 
-* {
-  box-sizing: border-box;
+/* ─────────────────────────────────────────────
+   AIVE Voice 디자인 토큰
+   브랜드 컬러 교체 방법:
+   --aive-accent 계열 3줄만 AIVE 실제 색으로 바꾸면
+   화면 전체(버튼, 화자 말풍선, 로고, 포커스링)가 따라감
+   ───────────────────────────────────────────── */
+
+:root {
+  /* 브랜드 (AIVE 색으로 교체하는 곳) */
+  --aive-accent: #3b5bdb;        /* 메인 포인트 (버튼, 화자 말풍선) */
+  --aive-accent-strong: #2f4ec4; /* hover */
+  --aive-accent-soft: #eef1fc;   /* 연한 배경 (진행 상태, 드롭존 hover) */
+
+  /* 중립 */
+  --aive-canvas: #fafbfc;        /* 페이지 배경 */
+  --aive-surface: #f1f3f6;       /* 카드 내부 회색면, 화자 0 말풍선 */
+  --aive-ink: #191f28;           /* 본문 텍스트 */
+  --aive-mute: #6b7684;          /* 보조 텍스트 */
+  --aive-line: #e4e8ee;          /* 테두리 */
+  --aive-spk0: #aab3c0;          /* 화자 0 범례 점 */
+
+  /* 상태 */
+  --aive-danger: #d6455d;
+  --aive-danger-soft: #fdf0f2;
+  --aive-danger-line: #f5cdd5;
 }
 
-html,
 body {
-  min-height: 100%;
-  margin: 0;
-}
-
-body {
-  background: #ffffff;
-  color: #171717;
-  font-family: Arial, Helvetica, sans-serif;
-}
-
-main {
-  display: grid;
-  min-height: 100vh;
-  place-content: center;
-  gap: 0.75rem;
-  padding: 2rem;
-  text-align: center;
-}
-
-h1,
-p {
-  margin: 0;
-}
-
-h1 {
-  font-size: 2rem;
-  line-height: 1.2;
-}
-
-p {
-  color: #4b5563;
-  line-height: 1.6;
+  font-family:
+    "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont,
+    system-ui, "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR",
+    "Malgun Gothic", sans-serif;
 }
