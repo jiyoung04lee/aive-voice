@@ -21,6 +21,8 @@ import {
   useState,
 } from "react";
 
+import { maskPersonalInfo } from "@/lib/masking";
+
 type Utterance = {
   start_at: number;
   duration: number;
@@ -89,11 +91,17 @@ function highlightSearchTerm(text: string, searchTerm: string): ReactNode {
   return nodes;
 }
 
-function buildTranscriptText(utterances: readonly Utterance[]): string {
-  const utteranceBlocks = utterances.map(
-    (utterance) =>
-      `[${formatTimestamp(utterance.start_at)}] 화자 ${utterance.spk}\n${utterance.msg}`,
-  );
+function buildTranscriptText(
+  utterances: readonly Utterance[],
+  shouldMaskPersonalInfo: boolean,
+): string {
+  const utteranceBlocks = utterances.map((utterance) => {
+    const message = shouldMaskPersonalInfo
+      ? maskPersonalInfo(utterance.msg)
+      : utterance.msg;
+
+    return `[${formatTimestamp(utterance.start_at)}] 화자 ${utterance.spk}\n${message}`;
+  });
 
   return ["AIVE Voice 전사 결과", ...utteranceBlocks].join("\n\n");
 }
@@ -187,6 +195,7 @@ export default function Home() {
   const [isDragging, setIsDragging] = useState(false);
   const [keywordInput, setKeywordInput] = useState("");
   const [searchInput, setSearchInput] = useState("");
+  const [isMaskingEnabled, setIsMaskingEnabled] = useState(true);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -307,6 +316,7 @@ export default function Home() {
     setUtterances([]);
     setPollCount(0);
     setSearchInput("");
+    setIsMaskingEnabled(true);
     setPhase("uploading");
 
     try {
@@ -356,6 +366,7 @@ export default function Home() {
     setIsDragging(false);
     setKeywordInput("");
     setSearchInput("");
+    setIsMaskingEnabled(true);
     pollStartRef.current = 0;
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
@@ -365,7 +376,10 @@ export default function Home() {
       return;
     }
 
-    const transcriptText = buildTranscriptText(utterances);
+    const transcriptText = buildTranscriptText(
+      utterances,
+      isMaskingEnabled,
+    );
     const blob = new Blob([`\uFEFF${transcriptText}`], {
       type: "text/plain;charset=utf-8",
     });
@@ -396,11 +410,17 @@ export default function Home() {
   const isBusy = phase === "uploading" || phase === "transcribing";
   const searchTerm = searchInput.trim();
   const normalizedSearchTerm = searchTerm.toLowerCase();
+  const displayUtterances = utterances.map((utterance) => ({
+    utterance,
+    displayMessage: isMaskingEnabled
+      ? maskPersonalInfo(utterance.msg)
+      : utterance.msg,
+  }));
   const visibleUtterances =
     normalizedSearchTerm === ""
-      ? utterances
-      : utterances.filter((utterance) =>
-          utterance.msg.toLowerCase().includes(normalizedSearchTerm),
+      ? displayUtterances
+      : displayUtterances.filter(({ displayMessage }) =>
+          displayMessage.toLowerCase().includes(normalizedSearchTerm),
         );
 
   return (
@@ -691,6 +711,34 @@ export default function Home() {
               </div>
             </div>
 
+            {/* 개인정보 표시 마스킹 */}
+            <div className="mb-4 flex flex-col gap-3 rounded-xl border border-[var(--aive-line)] bg-white p-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-[13px] font-semibold text-[var(--aive-ink)]">
+                  전화번호·이메일 가리기
+                </p>
+                <p
+                  id="masking-description"
+                  className="mt-1 text-[12px] leading-relaxed text-[var(--aive-mute)]"
+                >
+                  화면과 TXT 다운로드 파일에 현재 설정을 적용합니다.
+                </p>
+              </div>
+              <label className="inline-flex shrink-0 cursor-pointer items-center gap-2 text-[13px] font-medium text-[var(--aive-ink)]">
+                <input
+                  type="checkbox"
+                  checked={isMaskingEnabled}
+                  onChange={(event) =>
+                    setIsMaskingEnabled(event.target.checked)
+                  }
+                  aria-label="전화번호·이메일 가리기"
+                  aria-describedby="masking-description"
+                  className="h-4 w-4 accent-[var(--aive-accent)]"
+                />
+                {isMaskingEnabled ? "켜짐" : "꺼짐"}
+              </label>
+            </div>
+
             {/* 전사문 검색 */}
             <div className="mb-4 rounded-xl border border-[var(--aive-line)] bg-white p-3">
               <label htmlFor="transcript-search" className="sr-only">
@@ -735,49 +783,52 @@ export default function Home() {
 
             {/* 대화 목록 — VITO처럼 메신저 형태로 */}
             <ol className="space-y-3">
-              {visibleUtterances.map((u, idx) => {
-                const isSpeakerZero = u.spk === 0;
-                return (
-                  <li
-                    key={`${u.start_at}-${idx}`}
-                    className={[
-                      "flex flex-col",
-                      isSpeakerZero ? "items-start" : "items-end",
-                    ].join(" ")}
-                  >
-                    <div
+              {visibleUtterances.map(
+                ({ utterance: u, displayMessage }, idx) => {
+                  const isSpeakerZero = u.spk === 0;
+
+                  return (
+                    <li
+                      key={`${u.start_at}-${idx}`}
                       className={[
-                        "flex items-baseline gap-2 px-1 pb-1 text-[11px]",
-                        isSpeakerZero ? "" : "flex-row-reverse",
+                        "flex flex-col",
+                        isSpeakerZero ? "items-start" : "items-end",
                       ].join(" ")}
                     >
-                      <span
+                      <div
                         className={[
-                          "font-semibold",
-                          isSpeakerZero
-                            ? "text-[var(--aive-mute)]"
-                            : "text-[var(--aive-accent)]",
+                          "flex items-baseline gap-2 px-1 pb-1 text-[11px]",
+                          isSpeakerZero ? "" : "flex-row-reverse",
                         ].join(" ")}
                       >
-                        화자 {u.spk}
-                      </span>
-                      <time className="tabular-nums text-[var(--aive-mute)]">
-                        {formatTimestamp(u.start_at)}
-                      </time>
-                    </div>
-                    <p
-                      className={[
-                        "max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-[14px] leading-relaxed sm:max-w-[75%]",
-                        isSpeakerZero
-                          ? "rounded-tl-md bg-[var(--aive-surface)] text-[var(--aive-ink)]"
-                          : "rounded-tr-md bg-[var(--aive-accent)] text-white",
-                      ].join(" ")}
-                    >
-                      {highlightSearchTerm(u.msg, searchTerm)}
-                    </p>
-                  </li>
-                );
-              })}
+                        <span
+                          className={[
+                            "font-semibold",
+                            isSpeakerZero
+                              ? "text-[var(--aive-mute)]"
+                              : "text-[var(--aive-accent)]",
+                          ].join(" ")}
+                        >
+                          화자 {u.spk}
+                        </span>
+                        <time className="tabular-nums text-[var(--aive-mute)]">
+                          {formatTimestamp(u.start_at)}
+                        </time>
+                      </div>
+                      <p
+                        className={[
+                          "max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-[14px] leading-relaxed sm:max-w-[75%]",
+                          isSpeakerZero
+                            ? "rounded-tl-md bg-[var(--aive-surface)] text-[var(--aive-ink)]"
+                            : "rounded-tr-md bg-[var(--aive-accent)] text-white",
+                        ].join(" ")}
+                      >
+                        {highlightSearchTerm(displayMessage, searchTerm)}
+                      </p>
+                    </li>
+                  );
+                },
+              )}
             </ol>
           </section>
         )}
