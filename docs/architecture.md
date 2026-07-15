@@ -22,7 +22,7 @@ flowchart TD
     L <-->|전사 요청과 상태 조회| S[RTZR File STT API]
     L -->|전사 작업 ID| P
     P -->|전사 작업 ID| C
-    C -->|5초 간격 GET /api/transcriptions/{id}| G[GET Route Handler]
+    C -->|"5초 간격 GET /api/transcriptions/[id]"| G[GET Route Handler]
     G -->|상태 조회| L
     L -->|정리된 상태 결과| G
     G --> T{상태}
