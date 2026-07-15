@@ -1,22 +1,10 @@
 "use client";
 
-/**
- * AIVE Voice — 선배 인터뷰 음성 아카이브 프로토타입
- *
- * 화면 상태: idle → uploading → transcribing → completed | failed
- * 백엔드 계약 (구현 완료된 API 그대로 사용):
- *   POST /api/transcriptions            → { id }
- *   GET  /api/transcriptions/[id]       → { status: "transcribing" }
- *                                        | { status: "completed", utterances: [...] }
- *                                        | { status: "failed", error }
- *
- * 색상은 globals.css의 CSS 변수로 관리 (--aive-accent 하나만 바꾸면 브랜드 컬러 교체)
- */
-
 import {
   type ReactNode,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -33,18 +21,79 @@ type Utterance = {
 
 type Phase = "idle" | "uploading" | "transcribing" | "completed" | "failed";
 
+type ConversationTurn = {
+  speakerId: number;
+  startAt: number;
+  endAt: number;
+  utteranceIndexes: number[];
+};
+
 const ACCEPTED_EXTENSIONS = [".m4a", ".mp3", ".wav"];
-const POLL_INTERVAL_MS = 5000; // RTZR 권장 폴링 주기
+const POLL_INTERVAL_MS = 5000;
 const POLL_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_KEYWORD_COUNT = 500;
 const MAX_KEYWORD_LENGTH = 20;
 const COMPLETE_HANGUL_SYLLABLE_PATTERN = /^[\uAC00-\uD7A3]+$/u;
+const DEFAULT_INTERVIEWER_NAME = "인터뷰어";
+const DEFAULT_GUEST_NAME = "졸업생 선배";
 
 function formatTimestamp(ms: number): string {
   const totalSeconds = Math.floor(ms / 1000);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function isSupportedFile(name: string): boolean {
+  const lower = name.toLowerCase();
+  return ACCEPTED_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
+
+function normalizeKeywords(input: string): string[] {
+  const keywords = input
+    .split(",")
+    .map((keyword) => keyword.trim())
+    .filter((keyword) => keyword.length > 0);
+
+  return Array.from(new Set(keywords));
+}
+
+function validateKeywords(keywords: readonly string[]): string | null {
+  if (keywords.length > MAX_KEYWORD_COUNT) {
+    return "키워드는 최대 500개까지 입력할 수 있습니다.";
+  }
+
+  if (
+    keywords.some(
+      (keyword) => Array.from(keyword).length > MAX_KEYWORD_LENGTH,
+    )
+  ) {
+    return "키워드는 각각 20자 이하로 입력해주세요.";
+  }
+
+  if (
+    keywords.some(
+      (keyword) => !COMPLETE_HANGUL_SYLLABLE_PATTERN.test(keyword),
+    )
+  ) {
+    return "키워드는 한글로만 입력해주세요.";
+  }
+
+  return null;
+}
+
+function normalizeSpeakerName(value: string, fallback: string): string {
+  const normalized = value.trim();
+  return normalized === "" ? fallback : normalized;
+}
+
+function getInitial(name: string): string {
+  return Array.from(name.trim())[0] ?? "화";
 }
 
 function escapeRegExp(value: string): string {
@@ -91,74 +140,54 @@ function highlightSearchTerm(text: string, searchTerm: string): ReactNode {
   return nodes;
 }
 
-function buildTranscriptText(
+function buildConversationTurns(
   utterances: readonly Utterance[],
-  shouldMaskPersonalInfo: boolean,
-): string {
-  const utteranceBlocks = utterances.map((utterance) => {
-    const message = shouldMaskPersonalInfo
-      ? maskPersonalInfo(utterance.msg)
-      : utterance.msg;
+): ConversationTurn[] {
+  const turns: ConversationTurn[] = [];
 
-    return `[${formatTimestamp(utterance.start_at)}] 화자 ${utterance.spk}\n${message}`;
+  utterances.forEach((utterance, utteranceIndex) => {
+    const previousTurn = turns[turns.length - 1];
+    const utteranceEnd = utterance.start_at + utterance.duration;
+
+    if (previousTurn && previousTurn.speakerId === utterance.spk) {
+      previousTurn.endAt = utteranceEnd;
+      previousTurn.utteranceIndexes.push(utteranceIndex);
+      return;
+    }
+
+    turns.push({
+      speakerId: utterance.spk,
+      startAt: utterance.start_at,
+      endAt: utteranceEnd,
+      utteranceIndexes: [utteranceIndex],
+    });
   });
 
-  return ["AIVE Voice 전사 결과", ...utteranceBlocks].join("\n\n");
+  return turns;
 }
 
-function formatFileSize(bytes: number): string {
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)}KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-}
+function getSpeakerOrder(utterances: readonly Utterance[]): number[] {
+  const seen = new Set<number>();
+  const speakerOrder: number[] = [];
 
-function isSupportedFile(name: string): boolean {
-  const lower = name.toLowerCase();
-  return ACCEPTED_EXTENSIONS.some((ext) => lower.endsWith(ext));
-}
+  utterances.forEach((utterance) => {
+    if (!seen.has(utterance.spk)) {
+      seen.add(utterance.spk);
+      speakerOrder.push(utterance.spk);
+    }
+  });
 
-function normalizeKeywords(input: string): string[] {
-  const keywords = input
-    .split(",")
-    .map((keyword) => keyword.trim())
-    .filter((keyword) => keyword.length > 0);
-
-  return Array.from(new Set(keywords));
-}
-
-function validateKeywords(keywords: readonly string[]): string | null {
-  if (keywords.length > MAX_KEYWORD_COUNT) {
-    return "키워드는 최대 500개까지 입력할 수 있습니다.";
-  }
-
-  if (
-    keywords.some(
-      (keyword) => Array.from(keyword).length > MAX_KEYWORD_LENGTH,
-    )
-  ) {
-    return "키워드는 각각 20자 이하로 입력해주세요.";
-  }
-
-  if (
-    keywords.some(
-      (keyword) => !COMPLETE_HANGUL_SYLLABLE_PATTERN.test(keyword),
-    )
-  ) {
-    return "키워드는 한글로만 입력해주세요.";
-  }
-
-  return null;
+  return speakerOrder;
 }
 
 function resetAudioElement(audio: HTMLAudioElement | null): void {
-  if (!audio) {
-    return;
-  }
+  if (!audio) return;
 
   try {
     audio.pause();
     audio.currentTime = 0;
   } catch {
-    // 오디오가 아직 준비되지 않은 경우에도 다른 초기화는 계속 진행합니다.
+    // 오디오가 아직 준비되지 않아도 나머지 초기화는 계속 진행합니다.
   }
 }
 
@@ -166,9 +195,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasTranscriptionId(
-  value: unknown,
-): value is { id: string } {
+function hasTranscriptionId(value: unknown): value is { id: string } {
   return (
     isRecord(value) &&
     typeof value.id === "string" &&
@@ -199,6 +226,66 @@ function isUtterance(value: unknown): value is Utterance {
   );
 }
 
+function BrandHeader({ wide = false }: { wide?: boolean }) {
+  return (
+    <header className="border-b border-[var(--aive-line)] bg-white/90 backdrop-blur">
+      <div
+        className={[
+          "mx-auto flex items-center justify-between px-5 py-4",
+          wide ? "max-w-6xl" : "max-w-3xl",
+        ].join(" ")}
+      >
+        <div className="flex items-center gap-2.5">
+          <span
+            aria-hidden
+            className="flex h-8 w-8 items-end justify-center gap-[3px] rounded-lg bg-[var(--aive-accent)] px-1.5 pb-2"
+          >
+            <i className="h-2 w-[3px] rounded-full bg-white/90" />
+            <i className="h-4 w-[3px] rounded-full bg-white" />
+            <i className="h-2.5 w-[3px] rounded-full bg-white/90" />
+          </span>
+          <div className="leading-tight">
+            <p className="text-[15px] font-bold tracking-tight">
+              AIVE <span className="text-[var(--aive-accent)]">Voice</span>
+            </p>
+            <p className="text-[11px] text-[var(--aive-mute)]">
+              선배 인터뷰 음성 아카이브
+            </p>
+          </div>
+        </div>
+        <span className="rounded-full border border-[var(--aive-line)] px-2.5 py-1 text-[11px] font-medium text-[var(--aive-mute)]">
+          프로토타입
+        </span>
+      </div>
+    </header>
+  );
+}
+
+function ErrorNotice({ message }: { message: string }) {
+  return (
+    <div
+      role="alert"
+      className="flex items-start gap-3 rounded-xl border border-[var(--aive-danger-line)] bg-[var(--aive-danger-soft)] px-4 py-3.5"
+    >
+      <svg
+        aria-hidden
+        className="mt-0.5 h-4 w-4 shrink-0 text-[var(--aive-danger)]"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      >
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 8v4M12 16h.01" />
+      </svg>
+      <p className="text-[13px] font-medium leading-relaxed text-[var(--aive-danger)]">
+        {message}
+      </p>
+    </div>
+  );
+}
+
 export default function Home() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [file, setFile] = useState<File | null>(null);
@@ -207,6 +294,9 @@ export default function Home() {
   const [pollCount, setPollCount] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [keywordInput, setKeywordInput] = useState("");
+  const [interviewerName, setInterviewerName] = useState("");
+  const [guestName, setGuestName] = useState("");
+  const [isSpeakerOrderSwapped, setIsSpeakerOrderSwapped] = useState(false);
   const [searchInput, setSearchInput] = useState("");
   const [isMaskingEnabled, setIsMaskingEnabled] = useState(true);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -219,10 +309,10 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pollStartRef = useRef<number>(0);
+  const pollStartRef = useRef(0);
   const pendingMetadataCleanupRef = useRef<(() => void) | null>(null);
-  const utteranceElementRefs = useRef(new Map<number, HTMLLIElement>());
-  const lastHandledActiveIndexRef = useRef<number | null>(null);
+  const turnElementRefs = useRef(new Map<number, HTMLLIElement>());
+  const lastHandledActiveTurnRef = useRef<number | null>(null);
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current) {
@@ -242,7 +332,7 @@ export default function Home() {
     setAudioMessage(null);
     setActiveUtteranceIndex(null);
     setIsAudioPlaying(false);
-    lastHandledActiveIndexRef.current = null;
+    lastHandledActiveTurnRef.current = null;
   }, [clearPendingAudioSeek]);
 
   useEffect(() => stopPolling, [stopPolling]);
@@ -256,9 +346,7 @@ export default function Home() {
     const objectUrl = URL.createObjectURL(file);
     setAudioUrl(objectUrl);
 
-    return () => {
-      URL.revokeObjectURL(objectUrl);
-    };
+    return () => URL.revokeObjectURL(objectUrl);
   }, [file]);
 
   useEffect(
@@ -274,6 +362,7 @@ export default function Home() {
 
     resetAudioPlayback();
     setErrorMessage(null);
+
     if (!isSupportedFile(selected.name)) {
       stopPolling();
       setPhase("idle");
@@ -288,9 +377,12 @@ export default function Home() {
       );
       return;
     }
+
     setFile(selected);
     setPhase("idle");
     setUtterances([]);
+    setSearchInput("");
+    setIsSpeakerOrderSwapped(false);
   };
 
   const poll = useCallback(
@@ -303,10 +395,19 @@ export default function Home() {
         );
         return;
       }
+
       try {
-        const res = await fetch(`/api/transcriptions/${id}`);
-        if (!res.ok) throw new Error();
-        const data: unknown = await res.json();
+        const response = await fetch(`/api/transcriptions/${id}`);
+        const data: unknown = await response.json().catch(() => null);
+
+        if (!response.ok) {
+          throw new Error(
+            getErrorMessage(
+              data,
+              "전사 상태를 확인하지 못했습니다. 잠시 후 다시 시도해주세요.",
+            ),
+          );
+        }
 
         if (!isRecord(data)) {
           stopPolling();
@@ -316,7 +417,7 @@ export default function Home() {
         }
 
         if (data.status === "transcribing") {
-          setPollCount((n) => n + 1);
+          setPollCount((count) => count + 1);
           pollTimerRef.current = setTimeout(
             () => pollStatus(id),
             POLL_INTERVAL_MS,
@@ -346,11 +447,13 @@ export default function Home() {
         stopPolling();
         setPhase("failed");
         setErrorMessage("알 수 없는 전사 상태가 반환되었습니다.");
-      } catch {
+      } catch (error) {
         stopPolling();
         setPhase("failed");
         setErrorMessage(
-          "전사 상태를 확인하지 못했습니다. 네트워크 연결을 확인하고 다시 시도해주세요.",
+          error instanceof Error
+            ? error.message
+            : "전사 상태를 확인하지 못했습니다. 네트워크 연결을 확인하고 다시 시도해주세요.",
         );
       }
     },
@@ -378,6 +481,7 @@ export default function Home() {
     setPollCount(0);
     setSearchInput("");
     setIsMaskingEnabled(true);
+    setIsSpeakerOrderSwapped(false);
     setPhase("uploading");
 
     try {
@@ -388,18 +492,15 @@ export default function Home() {
         formData.append("keywords", JSON.stringify(keywords));
       }
 
-      const res = await fetch("/api/transcriptions", {
+      const response = await fetch("/api/transcriptions", {
         method: "POST",
         body: formData,
       });
-      if (!res.ok) {
-        const errorData: unknown = await res.json().catch(() => null);
-        throw new Error(
-          getErrorMessage(errorData, "전사 요청에 실패했습니다."),
-        );
-      }
+      const data: unknown = await response.json().catch(() => null);
 
-      const data: unknown = await res.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(getErrorMessage(data, "전사 요청에 실패했습니다."));
+      }
 
       if (!hasTranscriptionId(data)) {
         throw new Error("전사 작업 정보를 확인하지 못했습니다.");
@@ -409,10 +510,10 @@ export default function Home() {
       setPhase("transcribing");
       pollStartRef.current = Date.now();
       pollTimerRef.current = setTimeout(() => poll(id), POLL_INTERVAL_MS);
-    } catch (err) {
+    } catch (error) {
       setPhase("failed");
       setErrorMessage(
-        err instanceof Error ? err.message : "전사 요청에 실패했습니다.",
+        error instanceof Error ? error.message : "전사 요청에 실패했습니다.",
       );
     }
   };
@@ -427,9 +528,13 @@ export default function Home() {
     setPollCount(0);
     setIsDragging(false);
     setKeywordInput("");
+    setInterviewerName("");
+    setGuestName("");
+    setIsSpeakerOrderSwapped(false);
     setSearchInput("");
     setIsMaskingEnabled(true);
     pollStartRef.current = 0;
+    turnElementRefs.current.clear();
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
@@ -444,7 +549,6 @@ export default function Home() {
 
       const currentIndex = utterances.findIndex((utterance) => {
         const utteranceEnd = utterance.start_at + utterance.duration;
-
         return (
           Number.isFinite(utterance.start_at) &&
           Number.isFinite(utterance.duration) &&
@@ -459,15 +563,10 @@ export default function Home() {
   );
 
   const playAudioFrom = (startAt: number) => {
-    if (!Number.isFinite(startAt)) {
-      return;
-    }
+    if (!Number.isFinite(startAt)) return;
 
     const audio = audioRef.current;
-
-    if (!audio) {
-      return;
-    }
+    if (!audio) return;
 
     clearPendingAudioSeek();
     setAudioMessage(null);
@@ -507,21 +606,154 @@ export default function Home() {
     };
   };
 
-  const downloadTranscript = () => {
-    if (utterances.length === 0) {
+  const speakerOrder = useMemo(() => getSpeakerOrder(utterances), [utterances]);
+  const conversationTurns = useMemo(
+    () => buildConversationTurns(utterances),
+    [utterances],
+  );
+
+  const normalizedInterviewerName = normalizeSpeakerName(
+    interviewerName,
+    DEFAULT_INTERVIEWER_NAME,
+  );
+  const normalizedGuestName = normalizeSpeakerName(guestName, DEFAULT_GUEST_NAME);
+
+  const speakerNameMap = useMemo(() => {
+    const names = isSpeakerOrderSwapped
+      ? [normalizedGuestName, normalizedInterviewerName]
+      : [normalizedInterviewerName, normalizedGuestName];
+    const map = new Map<number, string>();
+
+    speakerOrder.forEach((speakerId, index) => {
+      map.set(speakerId, names[index] ?? `추가 화자 ${index - 1}`);
+    });
+
+    return map;
+  }, [
+    isSpeakerOrderSwapped,
+    normalizedGuestName,
+    normalizedInterviewerName,
+    speakerOrder,
+  ]);
+
+  const speakerSideMap = useMemo(() => {
+    const map = new Map<number, "left" | "right">();
+    speakerOrder.forEach((speakerId, index) => {
+      if (index === 0) {
+        map.set(speakerId, isSpeakerOrderSwapped ? "right" : "left");
+      } else if (index === 1) {
+        map.set(speakerId, isSpeakerOrderSwapped ? "left" : "right");
+      } else {
+        map.set(speakerId, "left");
+      }
+    });
+    return map;
+  }, [isSpeakerOrderSwapped, speakerOrder]);
+
+  const searchTerm = searchInput.trim();
+  const normalizedSearchTerm = searchTerm.toLowerCase();
+
+  const displayTurns = useMemo(
+    () =>
+      conversationTurns.map((turn, turnIndex) => {
+        const segments = turn.utteranceIndexes.map((utteranceIndex) => {
+          const utterance = utterances[utteranceIndex];
+          const displayMessage = isMaskingEnabled
+            ? maskPersonalInfo(utterance.msg)
+            : utterance.msg;
+          return { utteranceIndex, displayMessage };
+        });
+
+        return {
+          turn,
+          turnIndex,
+          segments,
+          combinedMessage: segments
+            .map(({ displayMessage }) => displayMessage)
+            .join(" "),
+          speakerName:
+            speakerNameMap.get(turn.speakerId) ?? `화자 ${turn.speakerId}`,
+          side: speakerSideMap.get(turn.speakerId) ?? "left",
+        };
+      }),
+    [
+      conversationTurns,
+      isMaskingEnabled,
+      speakerNameMap,
+      speakerSideMap,
+      utterances,
+    ],
+  );
+
+  const visibleTurns = useMemo(
+    () =>
+      normalizedSearchTerm === ""
+        ? displayTurns
+        : displayTurns.filter(({ combinedMessage }) =>
+            combinedMessage.toLowerCase().includes(normalizedSearchTerm),
+          ),
+    [displayTurns, normalizedSearchTerm],
+  );
+
+  const activeTurnIndex = useMemo(() => {
+    if (activeUtteranceIndex === null) return null;
+    const index = conversationTurns.findIndex((turn) =>
+      turn.utteranceIndexes.includes(activeUtteranceIndex),
+    );
+    return index >= 0 ? index : null;
+  }, [activeUtteranceIndex, conversationTurns]);
+
+  const isActiveTurnVisible =
+    activeTurnIndex !== null &&
+    visibleTurns.some(({ turnIndex }) => turnIndex === activeTurnIndex);
+
+  useEffect(() => {
+    if (activeTurnIndex === null) {
+      lastHandledActiveTurnRef.current = null;
       return;
     }
 
-    const transcriptText = buildTranscriptText(
-      utterances,
-      isMaskingEnabled,
-    );
+    if (!isAudioPlaying || !isActiveTurnVisible) return;
+    if (lastHandledActiveTurnRef.current === activeTurnIndex) return;
+
+    lastHandledActiveTurnRef.current = activeTurnIndex;
+    turnElementRefs.current
+      .get(activeTurnIndex)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [activeTurnIndex, isActiveTurnVisible, isAudioPlaying]);
+
+  const totalDurationMs =
+    utterances.length > 0
+      ? utterances[utterances.length - 1].start_at +
+        utterances[utterances.length - 1].duration
+      : 0;
+  const speakerCount = speakerOrder.length;
+  const isBusy = phase === "uploading" || phase === "transcribing";
+
+  const downloadTranscript = () => {
+    if (conversationTurns.length === 0) return;
+
+    const blocks = conversationTurns.map((turn) => {
+      const speakerName =
+        speakerNameMap.get(turn.speakerId) ?? `화자 ${turn.speakerId}`;
+      const message = turn.utteranceIndexes
+        .map((utteranceIndex) => {
+          const originalMessage = utterances[utteranceIndex].msg;
+          return isMaskingEnabled
+            ? maskPersonalInfo(originalMessage)
+            : originalMessage;
+        })
+        .join(" ");
+
+      return `[${formatTimestamp(turn.startAt)}] ${speakerName}\n${message}`;
+    });
+
+    const transcriptText = ["AIVE Voice 전사 결과", ...blocks].join("\n\n");
     const blob = new Blob([`\uFEFF${transcriptText}`], {
       type: "text/plain;charset=utf-8",
     });
     const objectUrl = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
-
     anchor.href = objectUrl;
     anchor.download = "aive-voice-transcript.txt";
 
@@ -534,57 +766,41 @@ export default function Home() {
     }
   };
 
-  const speakerIds = Array.from(new Set(utterances.map((u) => u.spk))).sort(
-    (a, b) => a - b,
-  );
-  const speakerCount = speakerIds.length;
-  const totalDurationMs =
-    utterances.length > 0
-      ? utterances[utterances.length - 1].start_at +
-        utterances[utterances.length - 1].duration
-      : 0;
-  const isBusy = phase === "uploading" || phase === "transcribing";
-  const searchTerm = searchInput.trim();
-  const normalizedSearchTerm = searchTerm.toLowerCase();
-  const displayUtterances = utterances.map((utterance, utteranceIndex) => ({
-    utterance,
-    utteranceIndex,
-    displayMessage: isMaskingEnabled
-      ? maskPersonalInfo(utterance.msg)
-      : utterance.msg,
-  }));
-  const visibleUtterances =
-    normalizedSearchTerm === ""
-      ? displayUtterances
-      : displayUtterances.filter(({ displayMessage }) =>
-          displayMessage.toLowerCase().includes(normalizedSearchTerm),
-        );
-  const isActiveUtteranceVisible =
-    activeUtteranceIndex !== null &&
-    visibleUtterances.some(
-      ({ utteranceIndex }) => utteranceIndex === activeUtteranceIndex,
-    );
+  const renderAudio = () =>
+    file && audioUrl ? (
+      <>
+        <audio
+          ref={audioRef}
+          src={audioUrl}
+          controls
+          preload="metadata"
+          onTimeUpdate={(event) =>
+            syncActiveUtterance(event.currentTarget.currentTime)
+          }
+          onSeeked={(event) =>
+            syncActiveUtterance(event.currentTarget.currentTime)
+          }
+          onPlay={(event) => {
+            setAudioMessage(null);
+            setIsAudioPlaying(true);
+            syncActiveUtterance(event.currentTarget.currentTime);
+          }}
+          onPause={() => setIsAudioPlaying(false)}
+          onEnded={() => {
+            setIsAudioPlaying(false);
+            setActiveUtteranceIndex(null);
+          }}
+          className="block w-full max-w-full"
+        />
+        {audioMessage && (
+          <p role="status" className="mt-2 text-xs text-[var(--aive-danger)]">
+            {audioMessage}
+          </p>
+        )}
+      </>
+    ) : null;
 
-  useEffect(() => {
-    if (activeUtteranceIndex === null) {
-      lastHandledActiveIndexRef.current = null;
-      return;
-    }
-
-    if (lastHandledActiveIndexRef.current === activeUtteranceIndex) {
-      return;
-    }
-
-    lastHandledActiveIndexRef.current = activeUtteranceIndex;
-
-    if (!isAudioPlaying || !isActiveUtteranceVisible) {
-      return;
-    }
-
-    utteranceElementRefs.current
-      .get(activeUtteranceIndex)
-      ?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [activeUtteranceIndex, isActiveUtteranceVisible, isAudioPlaying]);
+  const pageWide = phase === "completed";
 
   return (
     <div className="min-h-screen bg-[var(--aive-canvas)] font-sans text-[var(--aive-ink)] antialiased">
@@ -592,231 +808,252 @@ export default function Home() {
         rel="stylesheet"
         href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css"
       />
+      <BrandHeader wide={pageWide} />
 
-      {/* ── 헤더 ─────────────────────────────── */}
-      <header className="border-b border-[var(--aive-line)] bg-white/80 backdrop-blur">
-        <div className="mx-auto flex max-w-3xl items-center justify-between px-5 py-4">
-          <div className="flex items-center gap-2.5">
-            {/* 로고: 음성 파형을 형상화한 마크 */}
-            <span
-              aria-hidden
-              className="flex h-8 w-8 items-end justify-center gap-[3px] rounded-lg bg-[var(--aive-accent)] px-1.5 pb-2"
-            >
-              <i className="w-[3px] rounded-full bg-white/90 h-2" />
-              <i className="w-[3px] rounded-full bg-white h-4" />
-              <i className="w-[3px] rounded-full bg-white/90 h-2.5" />
-            </span>
-            <div className="leading-tight">
-              <p className="text-[15px] font-bold tracking-tight">
-                AIVE <span className="text-[var(--aive-accent)]">Voice</span>
-              </p>
-              <p className="text-[11px] text-[var(--aive-mute)]">
-                선배 인터뷰 음성 아카이브
-              </p>
-            </div>
-          </div>
-          <span className="rounded-full border border-[var(--aive-line)] px-2.5 py-1 text-[11px] font-medium text-[var(--aive-mute)]">
-            프로토타입
-          </span>
-        </div>
-      </header>
-
-      <main className="mx-auto max-w-3xl px-5 pb-24 pt-10">
-        {/* ── 인트로 ─────────────────────────── */}
-        <section className="mb-8">
-          <h1 className="text-[26px] font-bold leading-snug tracking-tight sm:text-3xl">
-            선배의 경험을,
-            <br className="sm:hidden" /> 읽고 검색할 수 있게
-          </h1>
-          <p className="mt-2.5 max-w-xl text-[15px] leading-relaxed text-[var(--aive-mute)]">
-            인터뷰 녹음을 올리면 화자별 대화록으로 바꿔드립니다. 긴 글을 쓰지
-            않아도 선배의 경험이 후배에게 남습니다.
-          </p>
-        </section>
-
-        {/* ── 업로드 카드 ─────────────────────── */}
-        <section className="rounded-2xl border border-[var(--aive-line)] bg-white p-5 shadow-[0_1px_2px_rgba(25,31,40,0.04)] sm:p-6">
-          <label
-            htmlFor="audio-file"
-            onDragOver={(e) => {
-              e.preventDefault();
-              if (!isBusy) setIsDragging(true);
-            }}
-            onDragLeave={() => setIsDragging(false)}
-            onDrop={(e) => {
-              e.preventDefault();
-              setIsDragging(false);
-              const droppedFile = e.dataTransfer.files?.[0];
-              if (!isBusy && droppedFile) handleFileSelected(droppedFile);
-            }}
-            className={[
-              "flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-10 text-center transition-colors",
-              isBusy ? "pointer-events-none opacity-60" : "",
-              isDragging
-                ? "border-[var(--aive-accent)] bg-[var(--aive-accent-soft)]"
-                : "border-[var(--aive-line)] hover:border-[var(--aive-accent)] hover:bg-[var(--aive-accent-soft)]",
-            ].join(" ")}
-          >
-            <svg
-              aria-hidden
-              className="mb-3 h-9 w-9 text-[var(--aive-accent)]"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M12 19V5" />
-              <path d="m5 12 7-7 7 7" />
-              <path d="M5 21h14" />
-            </svg>
-            <p className="text-[15px] font-semibold">
-              인터뷰 음성 파일을 올려주세요
+      {phase === "idle" && (
+        <main className="mx-auto max-w-3xl px-5 pb-24 pt-10">
+          <section className="mb-8">
+            <h1 className="text-[26px] font-bold leading-snug tracking-tight sm:text-3xl">
+              선배의 경험을,
+              <br className="sm:hidden" /> 읽고 검색할 수 있게
+            </h1>
+            <p className="mt-2.5 max-w-xl text-[15px] leading-relaxed text-[var(--aive-mute)]">
+              인터뷰 녹음을 올리면 화자별 대화록으로 바꿔드립니다. 긴 글을 쓰지
+              않아도 선배의 경험이 후배에게 남습니다.
             </p>
-            <p className="mt-1 text-[13px] text-[var(--aive-mute)]">
-              클릭해서 선택하거나 파일을 끌어다 놓기 · m4a, mp3, wav
-            </p>
-            <input
-              ref={fileInputRef}
-              id="audio-file"
-              type="file"
-              accept=".m4a,.mp3,.wav"
-              className="sr-only"
-              disabled={isBusy}
-              onChange={(e) => handleFileSelected(e.target.files?.[0] ?? null)}
-            />
-          </label>
+          </section>
 
-          {/* 선택된 파일 정보 */}
-          {file && (
-            <div className="mt-4 flex items-center justify-between rounded-xl bg-[var(--aive-surface)] px-4 py-3">
-              <div className="flex min-w-0 items-center gap-3">
-                <span
-                  aria-hidden
-                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-[var(--aive-accent)] shadow-sm"
-                >
-                  <svg
-                    className="h-4.5 w-4.5"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                  >
-                    <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6Z" />
-                  </svg>
-                </span>
-                <div className="min-w-0">
-                  <p className="truncate text-[14px] font-medium">{file.name}</p>
-                  <p className="text-[12px] text-[var(--aive-mute)]">
-                    {formatFileSize(file.size)}
-                  </p>
-                </div>
-              </div>
-              {!isBusy && (
-                <button
-                  type="button"
-                  onClick={reset}
-                  className="shrink-0 rounded-lg px-2.5 py-1.5 text-[13px] font-medium text-[var(--aive-mute)] hover:bg-white hover:text-[var(--aive-ink)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
-                >
-                  제거
-                </button>
-              )}
-            </div>
-          )}
-
-          {/* 키워드 부스팅 */}
-          <div className="mt-5 border-t border-[var(--aive-line)] pt-5">
+          <section className="rounded-2xl border border-[var(--aive-line)] bg-white p-5 shadow-[0_1px_2px_rgba(25,31,40,0.04)] sm:p-6">
             <label
-              htmlFor="transcription-keywords"
-              className="block text-[14px] font-semibold text-[var(--aive-ink)]"
-            >
-              인식할 주요 용어
-            </label>
-            <p
-              id="transcription-keywords-description"
-              className="mt-1 text-[13px] leading-relaxed text-[var(--aive-mute)]"
-            >
-              회사명, 직무명처럼 정확히 인식해야 하는 단어를 쉼표로 구분해
-              입력해주세요.
-            </p>
-            <input
-              id="transcription-keywords"
-              type="text"
-              value={keywordInput}
-              onChange={(event) => setKeywordInput(event.target.value)}
-              disabled={isBusy}
-              aria-describedby="transcription-keywords-description transcription-keywords-help"
-              placeholder="현대오토에버, 프론트엔드, 카카오뱅크, 커피챗"
-              className="mt-3 w-full rounded-xl border border-[var(--aive-line)] bg-white px-4 py-3 text-[14px] text-[var(--aive-ink)] outline-none transition placeholder:text-[var(--aive-mute)] focus:border-[var(--aive-accent)] focus:ring-2 focus:ring-[var(--aive-accent-soft)] disabled:cursor-not-allowed disabled:bg-[var(--aive-surface)] disabled:text-[var(--aive-mute)]"
-            />
-            <p
-              id="transcription-keywords-help"
-              className="mt-2 text-[12px] text-[var(--aive-mute)]"
-            >
-              선택 입력 · 한글 단어만 가능 · 키워드당 최대 20자
-            </p>
-          </div>
-
-          {/* 전사 시작 버튼 */}
-          <button
-            type="button"
-            onClick={startTranscription}
-            disabled={!file || isBusy}
-            className="mt-4 w-full rounded-xl bg-[var(--aive-accent)] py-3.5 text-[15px] font-semibold text-white transition-colors hover:bg-[var(--aive-accent-strong)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--aive-accent)] disabled:cursor-not-allowed disabled:bg-[var(--aive-line)] disabled:text-[var(--aive-mute)]"
-          >
-            {phase === "uploading"
-              ? "파일을 전송하고 있습니다…"
-              : phase === "transcribing"
-                ? "음성을 분석하고 있습니다…"
-                : "대화록 만들기"}
-          </button>
-
-          {/* 진행 상태 */}
-          {isBusy && (
-            <div
-              role="status"
-              className="mt-4 flex items-center gap-3 rounded-xl bg-[var(--aive-accent-soft)] px-4 py-3.5"
-            >
-              <span
-                aria-hidden
-                className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-[var(--aive-accent)] border-t-transparent motion-reduce:animate-none"
-              />
-              <div className="text-[13px] leading-relaxed">
-                {phase === "uploading" ? (
-                  <p className="font-medium text-[var(--aive-ink)]">
-                    파일을 안전하게 전송하고 있습니다.
-                  </p>
-                ) : (
-                  <>
-                    <p className="font-medium text-[var(--aive-ink)]">
-                      전사가 진행 중입니다. 5초마다 상태를 확인합니다.
-                      {pollCount > 0 && (
-                        <span className="ml-1 text-[var(--aive-mute)]">
-                          ({pollCount}회 확인)
-                        </span>
-                      )}
-                    </p>
-                    <p className="text-[var(--aive-mute)]">
-                      파일 길이와 서버 상황에 따라 처리 시간이 달라질 수 있습니다.
-                      화면을 유지해주세요.
-                    </p>
-                  </>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* 오류 메시지 */}
-          {errorMessage && (
-            <div
-              role="alert"
-              className="mt-4 flex items-start gap-3 rounded-xl border border-[var(--aive-danger-line)] bg-[var(--aive-danger-soft)] px-4 py-3.5"
+              htmlFor="audio-file"
+              onDragOver={(event) => {
+                event.preventDefault();
+                setIsDragging(true);
+              }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={(event) => {
+                event.preventDefault();
+                setIsDragging(false);
+                handleFileSelected(event.dataTransfer.files?.[0] ?? null);
+              }}
+              className={[
+                "flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-10 text-center transition-colors",
+                isDragging
+                  ? "border-[var(--aive-accent)] bg-[var(--aive-accent-soft)]"
+                  : "border-[var(--aive-line)] hover:border-[var(--aive-accent)] hover:bg-[var(--aive-accent-soft)]",
+              ].join(" ")}
             >
               <svg
                 aria-hidden
-                className="mt-0.5 h-4 w-4 shrink-0 text-[var(--aive-danger)]"
+                className="mb-3 h-9 w-9 text-[var(--aive-accent)]"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 19V5" />
+                <path d="m5 12 7-7 7 7" />
+                <path d="M5 21h14" />
+              </svg>
+              <p className="text-[15px] font-semibold">
+                인터뷰 음성 파일을 올려주세요
+              </p>
+              <p className="mt-1 text-[13px] text-[var(--aive-mute)]">
+                클릭해서 선택하거나 파일을 끌어다 놓기 · m4a, mp3, wav
+              </p>
+              <input
+                ref={fileInputRef}
+                id="audio-file"
+                type="file"
+                accept=".m4a,.mp3,.wav"
+                className="sr-only"
+                onChange={(event) =>
+                  handleFileSelected(event.target.files?.[0] ?? null)
+                }
+              />
+            </label>
+
+            {file && (
+              <div className="mt-4 flex items-center justify-between rounded-xl bg-[var(--aive-surface)] px-4 py-3">
+                <div className="flex min-w-0 items-center gap-3">
+                  <span
+                    aria-hidden
+                    className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-white text-[var(--aive-accent)] shadow-sm"
+                  >
+                    <svg
+                      className="h-5 w-5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="1.8"
+                      strokeLinecap="round"
+                    >
+                      <path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6Z" />
+                    </svg>
+                  </span>
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">{file.name}</p>
+                    <p className="text-xs text-[var(--aive-mute)]">
+                      {formatFileSize(file.size)}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    resetAudioPlayback();
+                    setFile(null);
+                    setUtterances([]);
+                    setErrorMessage(null);
+                    if (fileInputRef.current) fileInputRef.current.value = "";
+                  }}
+                  className="rounded-lg px-2.5 py-1.5 text-[13px] font-medium text-[var(--aive-mute)] hover:bg-white hover:text-[var(--aive-ink)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
+                >
+                  제거
+                </button>
+              </div>
+            )}
+
+            <div className="mt-5 border-t border-[var(--aive-line)] pt-5">
+              <label
+                htmlFor="transcription-keywords"
+                className="block text-sm font-semibold"
+              >
+                인식할 주요 용어
+              </label>
+              <p className="mt-1 text-[13px] leading-relaxed text-[var(--aive-mute)]">
+                회사명, 직무명처럼 정확히 인식해야 하는 단어를 쉼표로 구분해
+                입력해주세요.
+              </p>
+              <input
+                id="transcription-keywords"
+                type="text"
+                value={keywordInput}
+                onChange={(event) => setKeywordInput(event.target.value)}
+                placeholder="현대오토에버, 프론트엔드, 카카오뱅크, 커피챗"
+                className="mt-3 w-full rounded-xl border border-[var(--aive-line)] bg-white px-4 py-3 text-sm outline-none transition placeholder:text-[var(--aive-mute)] focus:border-[var(--aive-accent)] focus:ring-2 focus:ring-[var(--aive-accent-soft)]"
+              />
+              <p className="mt-2 text-xs text-[var(--aive-mute)]">
+                선택 입력 · 한글 단어만 가능 · 키워드당 최대 20자
+              </p>
+            </div>
+
+            <div className="mt-5 border-t border-[var(--aive-line)] pt-5">
+              <div className="flex items-center gap-2">
+                <h2 className="text-sm font-semibold">화자 이름</h2>
+                <span className="text-xs font-medium text-[var(--aive-mute)]">
+                  선택
+                </span>
+              </div>
+
+              <p className="mt-1 text-[13px] leading-relaxed text-[var(--aive-mute)]">
+                입력하지 않으면 인터뷰어와 졸업생 선배로 표시됩니다. 결과 화면에서
+                이름의 연결 순서를 바꿀 수 있습니다.
+              </p>
+
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium text-[var(--aive-mute)]">
+                    인터뷰어 이름
+                  </span>
+                  <input
+                    type="text"
+                    value={interviewerName}
+                    onChange={(event) => setInterviewerName(event.target.value)}
+                    maxLength={24}
+                    placeholder="예: 인터뷰어"
+                    className="w-full rounded-xl border border-[var(--aive-line)] bg-white px-4 py-3 text-sm outline-none transition placeholder:text-[var(--aive-mute)] focus:border-[var(--aive-accent)] focus:ring-2 focus:ring-[var(--aive-accent-soft)]"
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-medium text-[var(--aive-mute)]">
+                    인터뷰 대상자 이름
+                  </span>
+                  <input
+                    type="text"
+                    value={guestName}
+                    onChange={(event) => setGuestName(event.target.value)}
+                    maxLength={24}
+                    placeholder="예: 졸업생 선배"
+                    className="w-full rounded-xl border border-[var(--aive-line)] bg-white px-4 py-3 text-sm outline-none transition placeholder:text-[var(--aive-mute)] focus:border-[var(--aive-accent)] focus:ring-2 focus:ring-[var(--aive-accent-soft)]"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={startTranscription}
+              disabled={!file}
+              className="mt-5 w-full rounded-xl bg-[var(--aive-accent)] py-3.5 text-[15px] font-semibold text-white transition-colors hover:bg-[var(--aive-accent-strong)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--aive-accent)] disabled:cursor-not-allowed disabled:bg-[var(--aive-line)] disabled:text-[var(--aive-mute)]"
+            >
+              대화록 만들기
+            </button>
+
+            {errorMessage && (
+              <div className="mt-4">
+                <ErrorNotice message={errorMessage} />
+              </div>
+            )}
+          </section>
+        </main>
+      )}
+
+      {isBusy && (
+        <main className="mx-auto flex max-w-3xl items-center px-5 py-16 sm:min-h-[calc(100vh-132px)]">
+          <section
+            role="status"
+            aria-live="polite"
+            className="w-full rounded-3xl border border-[var(--aive-line)] bg-white px-6 py-16 text-center shadow-[0_8px_30px_rgba(25,31,40,0.05)] sm:px-10"
+          >
+            <div
+              aria-hidden
+              className="mx-auto flex h-16 items-center justify-center gap-2"
+            >
+              {[28, 48, 64, 44, 30].map((height, index) => (
+                <span
+                  key={height}
+                  className="w-2.5 animate-pulse rounded-full bg-[var(--aive-accent)] motion-reduce:animate-none"
+                  style={{
+                    height,
+                    animationDelay: `${index * 120}ms`,
+                    opacity: 0.45 + index * 0.1,
+                  }}
+                />
+              ))}
+            </div>
+            <h1 className="mt-5 text-2xl font-bold tracking-tight">
+              {phase === "uploading"
+                ? "음성 파일을 전송하고 있습니다"
+                : "음성을 분석하고 있습니다"}
+            </h1>
+            <p className="mt-3 text-[15px] text-[var(--aive-mute)]">
+              {file?.name}
+            </p>
+            <p className="mt-1 text-sm font-medium text-[var(--aive-ink)]">
+              5초마다 상태를 확인합니다
+              {phase === "transcribing" && pollCount > 0
+                ? ` · ${pollCount}회 확인`
+                : ""}
+            </p>
+            <p className="mt-5 text-[13px] leading-relaxed text-[var(--aive-mute)]">
+              파일 길이와 서버 상태에 따라 시간이 걸릴 수 있습니다.
+              <br />화면을 유지해주세요.
+            </p>
+          </section>
+        </main>
+      )}
+
+      {phase === "failed" && (
+        <main className="mx-auto flex max-w-3xl items-center px-5 py-16 sm:min-h-[calc(100vh-132px)]">
+          <section className="w-full rounded-3xl border border-[var(--aive-line)] bg-white px-6 py-12 text-center shadow-[0_8px_30px_rgba(25,31,40,0.05)] sm:px-10">
+            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-[var(--aive-danger-soft)] text-[var(--aive-danger)]">
+              <svg
+                aria-hidden
+                className="h-6 w-6"
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"
@@ -826,266 +1063,310 @@ export default function Home() {
                 <circle cx="12" cy="12" r="9" />
                 <path d="M12 8v4M12 16h.01" />
               </svg>
-              <div className="text-[13px] leading-relaxed">
-                <p className="font-medium text-[var(--aive-danger)]">
-                  {errorMessage}
-                </p>
-                {phase === "failed" && (
-                  <button
-                    type="button"
-                    onClick={reset}
-                    className="mt-1 font-semibold text-[var(--aive-ink)] underline underline-offset-2 hover:text-[var(--aive-accent)]"
-                  >
-                    처음부터 다시 시도
-                  </button>
-                )}
-              </div>
             </div>
-          )}
-        </section>
+            <h1 className="mt-5 text-2xl font-bold">
+              대화록을 만들지 못했습니다
+            </h1>
+            <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-[var(--aive-mute)]">
+              {errorMessage ?? "요청을 처리하는 중 오류가 발생했습니다."}
+            </p>
+            <button
+              type="button"
+              onClick={reset}
+              className="mt-7 rounded-xl bg-[var(--aive-accent)] px-6 py-3 text-sm font-semibold text-white hover:bg-[var(--aive-accent-strong)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--aive-accent)]"
+            >
+              처음부터 다시 시도
+            </button>
+          </section>
+        </main>
+      )}
 
-        {/* ── 전사 결과: 메신저형 대화 뷰 ─────────── */}
-        {phase === "completed" && utterances.length > 0 && (
-          <section className="mt-8" aria-label="전사 결과">
-            {/* 요약 바 */}
-            <div className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-xl bg-[var(--aive-surface)] px-4 py-3 text-[13px] text-[var(--aive-mute)]">
-              <span className="font-semibold text-[var(--aive-ink)]">
-                전사 완료
-              </span>
-              <span>발화 {utterances.length}개</span>
-              <span>화자 {speakerCount}명</span>
-              <span>길이 {formatTimestamp(totalDurationMs)}</span>
-              <div className="ml-auto flex items-center gap-3">
+      {phase === "completed" && utterances.length > 0 && (
+        <main className="mx-auto max-w-6xl px-5 pb-20 pt-7 lg:pt-9">
+          <div className="grid items-start gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
+            <aside className="space-y-4 lg:sticky lg:top-6">
+              <section className="rounded-2xl border border-[var(--aive-line)] bg-white p-5">
+                <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[var(--aive-mute)]">
+                  업로드한 파일
+                </p>
+                <p className="mt-2 truncate text-base font-bold">{file?.name}</p>
+                <p className="mt-1 text-sm text-[var(--aive-mute)]">
+                  발화 {utterances.length}개 · 화자 {speakerCount}명 ·{" "}
+                  {formatTimestamp(totalDurationMs)}
+                </p>
+              </section>
+
+              <section className="rounded-2xl border border-[var(--aive-line)] bg-white p-5">
+                <p className="mb-3 text-sm font-semibold">오디오</p>
+                {renderAudio()}
+                <p className="mt-3 text-xs leading-relaxed text-[var(--aive-mute)]">
+                  타임스탬프를 누르면 해당 대화 위치부터 재생됩니다.
+                </p>
+              </section>
+
+              <section className="rounded-2xl border border-[var(--aive-line)] bg-white p-5">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm font-semibold">화자 이름</p>
+                  {speakerOrder.length >= 2 && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setIsSpeakerOrderSwapped((value) => !value)
+                      }
+                      className="text-xs font-semibold text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
+                    >
+                      이름 순서 바꾸기
+                    </button>
+                  )}
+                </div>
+                <div className="mt-4 space-y-3">
+                  {speakerOrder.slice(0, 2).map((speakerId) => {
+                    const name = speakerNameMap.get(speakerId) ?? "화자";
+                    return (
+                      <div key={speakerId} className="flex items-center gap-3">
+                        <span className="flex h-9 w-9 items-center justify-center rounded-full bg-[var(--aive-accent-soft)] text-sm font-bold text-[var(--aive-accent)]">
+                          {getInitial(name)}
+                        </span>
+                        <span className="text-sm font-medium">{name}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+
+              <section className="rounded-2xl border border-[var(--aive-line)] bg-white p-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-semibold">개인정보 가리기</p>
+                    <p className="mt-1 text-xs leading-relaxed text-[var(--aive-mute)]">
+                      화면과 TXT 파일에 적용됩니다.
+                    </p>
+                  </div>
+                  <label className="inline-flex cursor-pointer items-center gap-2 text-xs font-semibold">
+                    <input
+                      type="checkbox"
+                      checked={isMaskingEnabled}
+                      onChange={(event) =>
+                        setIsMaskingEnabled(event.target.checked)
+                      }
+                      aria-label="전화번호·이메일 가리기"
+                      className="h-4 w-4 accent-[var(--aive-accent)]"
+                    />
+                    {isMaskingEnabled ? "켜짐" : "꺼짐"}
+                  </label>
+                </div>
+              </section>
+
+              <div className="flex flex-wrap gap-x-4 gap-y-2 px-1 text-sm font-semibold text-[var(--aive-accent)]">
                 <button
                   type="button"
                   onClick={downloadTranscript}
-                  disabled={utterances.length === 0}
-                  className="font-medium text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)] disabled:cursor-not-allowed disabled:text-[var(--aive-mute)] disabled:no-underline"
+                  className="hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
                 >
                   TXT 다운로드
                 </button>
                 <button
                   type="button"
                   onClick={reset}
-                  className="font-medium text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
+                  className="hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
                 >
                   새 인터뷰 전사
                 </button>
               </div>
-            </div>
+            </aside>
 
-            {/* 업로드한 오디오 재생 */}
-            {file && audioUrl && (
-              <div className="mb-4 rounded-xl border border-[var(--aive-line)] bg-white p-4">
-                <p className="text-[13px] font-semibold text-[var(--aive-ink)]">
-                  업로드한 인터뷰 음성
-                </p>
-                <p className="mt-1 text-[12px] leading-relaxed text-[var(--aive-mute)]">
-                  타임스탬프를 누르면 해당 발화 위치부터 재생됩니다.
-                </p>
-                <audio
-                  ref={audioRef}
-                  src={audioUrl}
-                  controls
-                  preload="metadata"
-                  onTimeUpdate={(event) =>
-                    syncActiveUtterance(event.currentTarget.currentTime)
-                  }
-                  onSeeked={(event) =>
-                    syncActiveUtterance(event.currentTarget.currentTime)
-                  }
-                  onPlay={(event) => {
-                    setAudioMessage(null);
-                    setIsAudioPlaying(true);
-                    syncActiveUtterance(event.currentTarget.currentTime);
-                  }}
-                  onPause={() => setIsAudioPlaying(false)}
-                  onEnded={() => {
-                    setIsAudioPlaying(false);
-                    setActiveUtteranceIndex(null);
-                  }}
-                  className="mt-3 block w-full max-w-full"
-                />
-                {audioMessage && (
-                  <p
-                    role="status"
-                    className="mt-2 text-[12px] text-[var(--aive-danger)]"
-                  >
-                    {audioMessage}
+            <section
+              className="min-w-0 rounded-2xl border border-[var(--aive-line)] bg-white p-4 sm:p-6 lg:p-7"
+              aria-label="인터뷰 대화록"
+            >
+              <div className="flex flex-col gap-5 border-b border-[var(--aive-line)] pb-5 sm:flex-row sm:items-end sm:justify-between">
+                <div>
+                  <h1 className="text-2xl font-bold tracking-tight">
+                    인터뷰 대화록
+                  </h1>
+                  <p className="mt-1 text-sm text-[var(--aive-mute)]">
+                    {conversationTurns.length}개 대화 · 화자 {speakerCount}명 ·{" "}
+                    {formatTimestamp(totalDurationMs)}
                   </p>
-                )}
-              </div>
-            )}
-
-            {/* 개인정보 표시 마스킹 */}
-            <div className="mb-4 flex flex-col gap-3 rounded-xl border border-[var(--aive-line)] bg-white p-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <p className="text-[13px] font-semibold text-[var(--aive-ink)]">
-                  전화번호·이메일 가리기
-                </p>
-                <p
-                  id="masking-description"
-                  className="mt-1 text-[12px] leading-relaxed text-[var(--aive-mute)]"
-                >
-                  화면과 TXT 다운로드 파일에 현재 설정을 적용합니다.
-                </p>
-              </div>
-              <label className="inline-flex shrink-0 cursor-pointer items-center gap-2 text-[13px] font-medium text-[var(--aive-ink)]">
-                <input
-                  type="checkbox"
-                  checked={isMaskingEnabled}
-                  onChange={(event) =>
-                    setIsMaskingEnabled(event.target.checked)
-                  }
-                  aria-label="전화번호·이메일 가리기"
-                  aria-describedby="masking-description"
-                  className="h-4 w-4 accent-[var(--aive-accent)]"
-                />
-                {isMaskingEnabled ? "켜짐" : "꺼짐"}
-              </label>
-            </div>
-
-            {/* 전사문 검색 */}
-            <div className="mb-4 rounded-xl border border-[var(--aive-line)] bg-white p-3">
-              <label htmlFor="transcript-search" className="sr-only">
-                전사 내용 검색
-              </label>
-              <input
-                id="transcript-search"
-                type="search"
-                value={searchInput}
-                onChange={(event) => setSearchInput(event.target.value)}
-                placeholder="전사 내용 검색"
-                className="w-full rounded-lg border border-[var(--aive-line)] bg-white px-3.5 py-2.5 text-[14px] text-[var(--aive-ink)] outline-none transition placeholder:text-[var(--aive-mute)] focus:border-[var(--aive-accent)] focus:ring-2 focus:ring-[var(--aive-accent-soft)]"
-              />
-              {searchTerm !== "" && (
-                <p
-                  aria-live="polite"
-                  className="mt-2 px-1 text-[12px] font-medium text-[var(--aive-mute)]"
-                >
-                  {visibleUtterances.length > 0
-                    ? `검색 결과 ${visibleUtterances.length}건`
-                    : "검색 결과가 없습니다."}
-                </p>
-              )}
-            </div>
-
-            {/* 화자 범례 */}
-            <div className="mb-4 flex items-center gap-4 px-1 text-[12px] text-[var(--aive-mute)]">
-              {speakerIds.map((speakerId) => (
-                <span key={speakerId} className="flex items-center gap-1.5">
-                  <i
-                    className={[
-                      "h-2.5 w-2.5 rounded-full",
-                      speakerId === 0
-                        ? "bg-[var(--aive-spk0)]"
-                        : "bg-[var(--aive-accent)]",
-                    ].join(" ")}
-                  />
-                  화자 {speakerId}
-                </span>
-              ))}
-            </div>
-
-            {/* 대화 목록 — VITO처럼 메신저 형태로 */}
-            <ol className="space-y-3">
-              {visibleUtterances.map(
-                ({ utterance: u, utteranceIndex, displayMessage }) => {
-                  const isSpeakerZero = u.spk === 0;
-                  const isActive = utteranceIndex === activeUtteranceIndex;
-
-                  return (
-                    <li
-                      key={`${u.start_at}-${utteranceIndex}`}
-                      ref={(element) => {
-                        if (element) {
-                          utteranceElementRefs.current.set(
-                            utteranceIndex,
-                            element,
-                          );
-                        } else {
-                          utteranceElementRefs.current.delete(utteranceIndex);
-                        }
-                      }}
-                      aria-current={isActive ? "true" : undefined}
-                      className={[
-                        "scroll-mt-28 flex flex-col",
-                        isSpeakerZero ? "items-start" : "items-end",
-                      ].join(" ")}
+                </div>
+                <div className="w-full sm:max-w-sm">
+                  <label htmlFor="transcript-search" className="sr-only">
+                    전사 내용 검색
+                  </label>
+                  <div className="relative">
+                    <svg
+                      aria-hidden
+                      className="absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--aive-mute)]"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
                     >
-                      <div
-                        className={[
-                          "flex items-baseline gap-2 px-1 pb-1 text-[11px]",
-                          isSpeakerZero ? "" : "flex-row-reverse",
-                        ].join(" ")}
-                      >
-                        <span
+                      <circle cx="11" cy="11" r="7" />
+                      <path d="m20 20-4-4" />
+                    </svg>
+                    <input
+                      id="transcript-search"
+                      type="search"
+                      value={searchInput}
+                      onChange={(event) => setSearchInput(event.target.value)}
+                      placeholder="전사 내용 검색"
+                      className="w-full rounded-xl border border-[var(--aive-line)] bg-white py-3 pl-10 pr-4 text-sm outline-none transition placeholder:text-[var(--aive-mute)] focus:border-[var(--aive-accent)] focus:ring-2 focus:ring-[var(--aive-accent-soft)]"
+                    />
+                  </div>
+                  {searchTerm !== "" && (
+                    <p
+                      aria-live="polite"
+                      className="mt-2 text-xs font-medium text-[var(--aive-mute)]"
+                    >
+                      {visibleTurns.length > 0
+                        ? `검색 결과 ${visibleTurns.length}개 대화`
+                        : "검색 결과가 없습니다."}
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              {visibleTurns.length === 0 ? (
+                <div className="py-20 text-center text-sm text-[var(--aive-mute)]">
+                  검색 결과가 없습니다.
+                </div>
+              ) : (
+                <ol className="mt-6 space-y-5">
+                  {visibleTurns.map(
+                    ({ turn, turnIndex, segments, speakerName, side }) => {
+                      const isRight = side === "right";
+                      const isActive = turnIndex === activeTurnIndex;
+
+                      return (
+                        <li
+                          key={`${turn.startAt}-${turnIndex}`}
+                          ref={(element) => {
+                            if (element) {
+                              turnElementRefs.current.set(turnIndex, element);
+                            } else {
+                              turnElementRefs.current.delete(turnIndex);
+                            }
+                          }}
+                          aria-current={isActive ? "true" : undefined}
                           className={[
-                            "font-semibold",
-                            isSpeakerZero
-                              ? "text-[var(--aive-mute)]"
-                              : "text-[var(--aive-accent)]",
+                            "scroll-mt-24 flex gap-3",
+                            isRight ? "justify-end" : "justify-start",
                           ].join(" ")}
                         >
-                          화자 {u.spk}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => playAudioFrom(u.start_at)}
-                          aria-label={`${formatTimestamp(u.start_at)}부터 재생`}
-                          className="rounded tabular-nums text-[var(--aive-mute)] underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
-                        >
-                          {formatTimestamp(u.start_at)}
-                        </button>
-                      </div>
-                      <p
-                        className={[
-                          "max-w-[85%] whitespace-pre-wrap rounded-2xl px-4 py-3 text-[14px] leading-relaxed sm:max-w-[75%]",
-                          isSpeakerZero
-                            ? "rounded-tl-md bg-[var(--aive-surface)] text-[var(--aive-ink)]"
-                            : "rounded-tr-md bg-[var(--aive-accent)] text-white",
-                          isActive
-                            ? "ring-2 ring-[var(--aive-accent)] ring-offset-2 shadow-[0_4px_14px_rgba(59,91,219,0.18)]"
-                            : "",
-                        ].join(" ")}
-                      >
-                        {highlightSearchTerm(displayMessage, searchTerm)}
-                      </p>
-                    </li>
-                  );
-                },
+                          {!isRight && (
+                            <span className="mt-6 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--aive-surface)] text-sm font-bold text-[var(--aive-ink)]">
+                              {getInitial(speakerName)}
+                            </span>
+                          )}
+
+                          <div className="max-w-[82%] sm:max-w-[76%]">
+                            <div
+                              className={[
+                                "mb-1.5 flex items-center gap-2 px-1 text-xs",
+                                isRight ? "justify-end" : "justify-start",
+                              ].join(" ")}
+                            >
+                              <span
+                                className={[
+                                  "font-semibold",
+                                  isRight
+                                    ? "text-[var(--aive-accent)]"
+                                    : "text-[var(--aive-ink)]",
+                                ].join(" ")}
+                              >
+                                {speakerName}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => playAudioFrom(turn.startAt)}
+                                aria-label={`${formatTimestamp(turn.startAt)}부터 재생`}
+                                className="rounded tabular-nums text-[var(--aive-mute)] underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
+                              >
+                                {formatTimestamp(turn.startAt)}
+                              </button>
+                            </div>
+
+                            <div
+                              className={[
+                                "rounded-2xl px-4 py-3.5 text-[15px] leading-7 transition",
+                                isRight
+                                  ? "rounded-tr-md bg-[var(--aive-accent)] text-white"
+                                  : "rounded-tl-md bg-[var(--aive-surface)] text-[var(--aive-ink)]",
+                                isActive
+                                  ? "ring-2 ring-[var(--aive-accent)] ring-offset-2 shadow-[0_5px_18px_rgba(59,91,219,0.16)]"
+                                  : "",
+                              ].join(" ")}
+                            >
+                              {segments.map(
+                                (
+                                  { utteranceIndex, displayMessage },
+                                  segmentIndex,
+                                ) => {
+                                  const isActiveSegment =
+                                    utteranceIndex === activeUtteranceIndex;
+
+                                  return (
+                                    <span
+                                      key={utteranceIndex}
+                                      className={[
+                                        "rounded px-0.5",
+                                        isActiveSegment
+                                          ? isRight
+                                            ? "bg-white/15"
+                                            : "bg-[var(--aive-accent-soft)]"
+                                          : "",
+                                      ].join(" ")}
+                                    >
+                                      {highlightSearchTerm(
+                                        displayMessage,
+                                        searchTerm,
+                                      )}
+                                      {segmentIndex < segments.length - 1
+                                        ? " "
+                                        : ""}
+                                    </span>
+                                  );
+                                },
+                              )}
+                            </div>
+                          </div>
+
+                          {isRight && (
+                            <span className="mt-6 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--aive-accent-soft)] text-sm font-bold text-[var(--aive-accent)]">
+                              {getInitial(speakerName)}
+                            </span>
+                          )}
+                        </li>
+                      );
+                    },
+                  )}
+                </ol>
               )}
-            </ol>
-          </section>
-        )}
+            </section>
+          </div>
+        </main>
+      )}
 
-        {phase === "completed" && utterances.length === 0 && (
-          <section className="mt-8" aria-label="빈 전사 결과">
-            <div className="flex flex-wrap items-center gap-3 rounded-xl bg-[var(--aive-surface)] px-4 py-4 text-[13px] text-[var(--aive-mute)]">
-              <p>전사는 완료되었지만 표시할 발화 내용이 없습니다.</p>
-              <div className="ml-auto flex items-center gap-3">
-                <button
-                  type="button"
-                  onClick={downloadTranscript}
-                  disabled
-                  className="cursor-not-allowed font-medium text-[var(--aive-mute)]"
-                >
-                  TXT 다운로드
-                </button>
-                <button
-                  type="button"
-                  onClick={reset}
-                  className="font-medium text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
-                >
-                  새 인터뷰 전사
-                </button>
-              </div>
-            </div>
+      {phase === "completed" && utterances.length === 0 && (
+        <main className="mx-auto max-w-3xl px-5 py-16">
+          <section className="rounded-2xl border border-[var(--aive-line)] bg-white p-8 text-center">
+            <p className="text-sm text-[var(--aive-mute)]">
+              전사는 완료되었지만 표시할 발화 내용이 없습니다.
+            </p>
+            <button
+              type="button"
+              onClick={reset}
+              className="mt-5 rounded-xl bg-[var(--aive-accent)] px-5 py-3 text-sm font-semibold text-white hover:bg-[var(--aive-accent-strong)]"
+            >
+              새 인터뷰 전사
+            </button>
           </section>
-        )}
-      </main>
+        </main>
+      )}
 
-      <footer className="border-t border-[var(--aive-line)] py-6 text-center text-[12px] text-[var(--aive-mute)]">
+      <footer className="border-t border-[var(--aive-line)] py-6 text-center text-xs text-[var(--aive-mute)]">
         AIVE Voice · RTZR STT OpenAPI 기반 프로토타입
       </footer>
     </div>
