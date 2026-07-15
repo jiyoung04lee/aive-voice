@@ -7,8 +7,11 @@ const EMAIL_PATTERN =
 const SPOKEN_ENGLISH_LETTER_PATTERN =
   "(?:에이|비|씨|디|이|에프|지|에이치|아이|제이|케이|엘|엠|엔|오|피|큐|알|에스|티|유|브이|더블유|엑스|와이|제트)";
 
+const SPOKEN_EMAIL_TOKEN_PATTERN =
+  `(?:[가-힣A-Za-z0-9]{1,20}|${SPOKEN_ENGLISH_LETTER_PATTERN}(?:\\s+${SPOKEN_ENGLISH_LETTER_PATTERN}){1,11})`;
+
 const SPOKEN_EMAIL_PATTERN = new RegExp(
-  `(?<![가-힣A-Za-z0-9])(?:[가-힣]{1,20}|${SPOKEN_ENGLISH_LETTER_PATTERN}(?:\\s+${SPOKEN_ENGLISH_LETTER_PATTERN}){1,11})\\s+(?:앳|골뱅이)\\s+[가-힣]{1,20}\\s+(?:닷|점)\\s+(?:씨오케이알|오알지|케이알|컴|넷)(\\s*(?:앤드로|으로|로))?(?![가-힣A-Za-z0-9])`,
+  `(?<![가-힣A-Za-z0-9])${SPOKEN_EMAIL_TOKEN_PATTERN}\\s+(?:앳|골뱅이)\\s+${SPOKEN_EMAIL_TOKEN_PATTERN}\\s+(?:닷|점)\\s+(?:씨오케이알|오알지|케이알|컴|넷)(\\s*(?:앤드로|으로|로))?(?![가-힣A-Za-z0-9])`,
   "g",
 );
 
