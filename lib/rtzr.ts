@@ -2,6 +2,7 @@ import "server-only";
 
 const RTZR_AUTHENTICATE_URL = "https://openapi.vito.ai/v1/authenticate";
 const RTZR_TRANSCRIBE_URL = "https://openapi.vito.ai/v1/transcribe";
+const RTZR_TOKEN_REFRESH_BEFORE_SECONDS = 5 * 60;
 
 interface RtzrFileTranscriptionConfig {
   model_name: "sommers";
@@ -40,6 +41,9 @@ export interface RtzrAuthToken {
   access_token: string;
   expire_at: number;
 }
+
+let cachedAuthToken: RtzrAuthToken | null = null;
+let authenticationPromise: Promise<RtzrAuthToken> | null = null;
 
 interface RtzrErrorResponse {
   code: string;
@@ -259,7 +263,27 @@ function readRtzrCredentials(): {
   };
 }
 
-export async function authenticateRtzr(): Promise<RtzrAuthToken> {
+function getValidCachedAuthToken(): RtzrAuthToken | null {
+  if (!cachedAuthToken || !cachedAuthToken.access_token.trim()) {
+    return null;
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  const isValid =
+    nowSeconds <
+    cachedAuthToken.expire_at - RTZR_TOKEN_REFRESH_BEFORE_SECONDS;
+
+  return isValid ? cachedAuthToken : null;
+}
+
+function invalidateCachedAuthToken(accessToken: string): void {
+  if (cachedAuthToken?.access_token === accessToken) {
+    cachedAuthToken = null;
+  }
+}
+
+async function requestNewRtzrAuthToken(): Promise<RtzrAuthToken> {
   const { clientId, clientSecret } = readRtzrCredentials();
   const requestBody = new URLSearchParams({
     client_id: clientId,
@@ -303,28 +327,71 @@ export async function authenticateRtzr(): Promise<RtzrAuthToken> {
   return responseBody;
 }
 
+export async function authenticateRtzr(): Promise<RtzrAuthToken> {
+  const validCachedAuthToken = getValidCachedAuthToken();
+
+  if (validCachedAuthToken) {
+    return validCachedAuthToken;
+  }
+
+  if (authenticationPromise) {
+    return authenticationPromise;
+  }
+
+  cachedAuthToken = null;
+  const pendingAuthentication = requestNewRtzrAuthToken();
+  authenticationPromise = pendingAuthentication;
+
+  try {
+    const authToken = await pendingAuthentication;
+    cachedAuthToken = authToken;
+    return authToken;
+  } finally {
+    if (authenticationPromise === pendingAuthentication) {
+      authenticationPromise = null;
+    }
+  }
+}
+
+async function fetchRtzrWithAuthenticationRetry(
+  request: (accessToken: string) => Promise<Response>,
+): Promise<Response> {
+  const { access_token: accessToken } = await authenticateRtzr();
+  const response = await request(accessToken);
+
+  if (response.status !== 401) {
+    return response;
+  }
+
+  invalidateCachedAuthToken(accessToken);
+  const { access_token: refreshedAccessToken } = await authenticateRtzr();
+
+  return request(refreshedAccessToken);
+}
+
 export async function createRtzrTranscription(
   file: File,
   keywords?: readonly string[],
 ): Promise<RtzrTranscriptionJob> {
-  const { access_token: accessToken } = await authenticateRtzr();
-  const requestBody = new FormData();
   const transcriptionConfig: RtzrFileTranscriptionConfig =
     keywords && keywords.length > 0
       ? { ...config, keywords: [...keywords] }
       : config;
 
-  requestBody.append("file", file);
-  requestBody.append("config", JSON.stringify(transcriptionConfig));
+  const response = await fetchRtzrWithAuthenticationRetry((accessToken) => {
+    const requestBody = new FormData();
+    requestBody.append("file", file);
+    requestBody.append("config", JSON.stringify(transcriptionConfig));
 
-  const response = await fetch(RTZR_TRANSCRIBE_URL, {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      Authorization: `Bearer ${accessToken}`,
-    },
-    body: requestBody,
-    cache: "no-store",
+    return fetch(RTZR_TRANSCRIBE_URL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: requestBody,
+      cache: "no-store",
+    });
   });
 
   let responseBody: unknown;
@@ -357,18 +424,17 @@ export async function createRtzrTranscription(
 export async function getRtzrTranscriptionStatus(
   transcriptionId: string,
 ): Promise<RtzrTranscriptionStatus> {
-  const { access_token: accessToken } = await authenticateRtzr();
   const safeTranscriptionId = encodeURIComponent(transcriptionId);
-  const response = await fetch(
-    `${RTZR_TRANSCRIBE_URL}/${safeTranscriptionId}`,
-    {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${accessToken}`,
-      },
-      cache: "no-store",
-    },
+  const response = await fetchRtzrWithAuthenticationRetry(
+    (accessToken) =>
+      fetch(`${RTZR_TRANSCRIBE_URL}/${safeTranscriptionId}`, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        cache: "no-store",
+      }),
   );
 
   let responseBody: unknown;
