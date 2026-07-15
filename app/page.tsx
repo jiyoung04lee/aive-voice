@@ -149,6 +149,19 @@ function validateKeywords(keywords: readonly string[]): string | null {
   return null;
 }
 
+function resetAudioElement(audio: HTMLAudioElement | null): void {
+  if (!audio) {
+    return;
+  }
+
+  try {
+    audio.pause();
+    audio.currentTime = 0;
+  } catch {
+    // 오디오가 아직 준비되지 않은 경우에도 다른 초기화는 계속 진행합니다.
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -196,10 +209,20 @@ export default function Home() {
   const [keywordInput, setKeywordInput] = useState("");
   const [searchInput, setSearchInput] = useState("");
   const [isMaskingEnabled, setIsMaskingEnabled] = useState(true);
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [audioMessage, setAudioMessage] = useState<string | null>(null);
+  const [activeUtteranceIndex, setActiveUtteranceIndex] = useState<
+    number | null
+  >(null);
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollStartRef = useRef<number>(0);
+  const pendingMetadataCleanupRef = useRef<(() => void) | null>(null);
+  const utteranceElementRefs = useRef(new Map<number, HTMLLIElement>());
+  const lastHandledActiveIndexRef = useRef<number | null>(null);
 
   const stopPolling = useCallback(() => {
     if (pollTimerRef.current) {
@@ -208,11 +231,48 @@ export default function Home() {
     }
   }, []);
 
+  const clearPendingAudioSeek = useCallback(() => {
+    pendingMetadataCleanupRef.current?.();
+    pendingMetadataCleanupRef.current = null;
+  }, []);
+
+  const resetAudioPlayback = useCallback(() => {
+    clearPendingAudioSeek();
+    resetAudioElement(audioRef.current);
+    setAudioMessage(null);
+    setActiveUtteranceIndex(null);
+    setIsAudioPlaying(false);
+    lastHandledActiveIndexRef.current = null;
+  }, [clearPendingAudioSeek]);
+
   useEffect(() => stopPolling, [stopPolling]);
+
+  useEffect(() => {
+    if (!file) {
+      setAudioUrl(null);
+      return;
+    }
+
+    const objectUrl = URL.createObjectURL(file);
+    setAudioUrl(objectUrl);
+
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [file]);
+
+  useEffect(
+    () => () => {
+      clearPendingAudioSeek();
+      resetAudioElement(audioRef.current);
+    },
+    [clearPendingAudioSeek],
+  );
 
   const handleFileSelected = (selected: File | null) => {
     if (!selected) return;
 
+    resetAudioPlayback();
     setErrorMessage(null);
     if (!isSupportedFile(selected.name)) {
       stopPolling();
@@ -312,6 +372,7 @@ export default function Home() {
       return;
     }
 
+    resetAudioPlayback();
     setErrorMessage(null);
     setUtterances([]);
     setPollCount(0);
@@ -358,6 +419,7 @@ export default function Home() {
 
   const reset = () => {
     stopPolling();
+    resetAudioPlayback();
     setPhase("idle");
     setFile(null);
     setUtterances([]);
@@ -369,6 +431,80 @@ export default function Home() {
     setIsMaskingEnabled(true);
     pollStartRef.current = 0;
     if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const syncActiveUtterance = useCallback(
+    (currentTimeSeconds: number) => {
+      const currentTimeMs = currentTimeSeconds * 1000;
+
+      if (!Number.isFinite(currentTimeMs)) {
+        setActiveUtteranceIndex(null);
+        return;
+      }
+
+      const currentIndex = utterances.findIndex((utterance) => {
+        const utteranceEnd = utterance.start_at + utterance.duration;
+
+        return (
+          Number.isFinite(utterance.start_at) &&
+          Number.isFinite(utterance.duration) &&
+          currentTimeMs >= utterance.start_at &&
+          currentTimeMs < utteranceEnd
+        );
+      });
+
+      setActiveUtteranceIndex(currentIndex >= 0 ? currentIndex : null);
+    },
+    [utterances],
+  );
+
+  const playAudioFrom = (startAt: number) => {
+    if (!Number.isFinite(startAt)) {
+      return;
+    }
+
+    const audio = audioRef.current;
+
+    if (!audio) {
+      return;
+    }
+
+    clearPendingAudioSeek();
+    setAudioMessage(null);
+
+    const seekAndPlay = async () => {
+      const requestedTime = Math.max(0, startAt / 1000);
+      const targetTime = Number.isFinite(audio.duration)
+        ? Math.min(requestedTime, audio.duration)
+        : requestedTime;
+
+      try {
+        audio.currentTime = targetTime;
+        syncActiveUtterance(targetTime);
+        await audio.play();
+      } catch {
+        setAudioMessage(
+          "오디오를 자동으로 재생하지 못했습니다. 재생 버튼을 눌러주세요.",
+        );
+      }
+    };
+
+    if (audio.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      void seekAndPlay();
+      return;
+    }
+
+    const handleLoadedMetadata = () => {
+      pendingMetadataCleanupRef.current = null;
+      void seekAndPlay();
+    };
+
+    audio.addEventListener("loadedmetadata", handleLoadedMetadata, {
+      once: true,
+    });
+    pendingMetadataCleanupRef.current = () => {
+      audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
+    };
   };
 
   const downloadTranscript = () => {
@@ -410,8 +546,9 @@ export default function Home() {
   const isBusy = phase === "uploading" || phase === "transcribing";
   const searchTerm = searchInput.trim();
   const normalizedSearchTerm = searchTerm.toLowerCase();
-  const displayUtterances = utterances.map((utterance) => ({
+  const displayUtterances = utterances.map((utterance, utteranceIndex) => ({
     utterance,
+    utteranceIndex,
     displayMessage: isMaskingEnabled
       ? maskPersonalInfo(utterance.msg)
       : utterance.msg,
@@ -422,6 +559,32 @@ export default function Home() {
       : displayUtterances.filter(({ displayMessage }) =>
           displayMessage.toLowerCase().includes(normalizedSearchTerm),
         );
+  const isActiveUtteranceVisible =
+    activeUtteranceIndex !== null &&
+    visibleUtterances.some(
+      ({ utteranceIndex }) => utteranceIndex === activeUtteranceIndex,
+    );
+
+  useEffect(() => {
+    if (activeUtteranceIndex === null) {
+      lastHandledActiveIndexRef.current = null;
+      return;
+    }
+
+    if (lastHandledActiveIndexRef.current === activeUtteranceIndex) {
+      return;
+    }
+
+    lastHandledActiveIndexRef.current = activeUtteranceIndex;
+
+    if (!isAudioPlaying || !isActiveUtteranceVisible) {
+      return;
+    }
+
+    utteranceElementRefs.current
+      .get(activeUtteranceIndex)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [activeUtteranceIndex, isActiveUtteranceVisible, isAudioPlaying]);
 
   return (
     <div className="min-h-screen bg-[var(--aive-canvas)] font-sans text-[var(--aive-ink)] antialiased">
@@ -711,6 +874,49 @@ export default function Home() {
               </div>
             </div>
 
+            {/* 업로드한 오디오 재생 */}
+            {file && audioUrl && (
+              <div className="mb-4 rounded-xl border border-[var(--aive-line)] bg-white p-4">
+                <p className="text-[13px] font-semibold text-[var(--aive-ink)]">
+                  업로드한 인터뷰 음성
+                </p>
+                <p className="mt-1 text-[12px] leading-relaxed text-[var(--aive-mute)]">
+                  타임스탬프를 누르면 해당 발화 위치부터 재생됩니다.
+                </p>
+                <audio
+                  ref={audioRef}
+                  src={audioUrl}
+                  controls
+                  preload="metadata"
+                  onTimeUpdate={(event) =>
+                    syncActiveUtterance(event.currentTarget.currentTime)
+                  }
+                  onSeeked={(event) =>
+                    syncActiveUtterance(event.currentTarget.currentTime)
+                  }
+                  onPlay={(event) => {
+                    setAudioMessage(null);
+                    setIsAudioPlaying(true);
+                    syncActiveUtterance(event.currentTarget.currentTime);
+                  }}
+                  onPause={() => setIsAudioPlaying(false)}
+                  onEnded={() => {
+                    setIsAudioPlaying(false);
+                    setActiveUtteranceIndex(null);
+                  }}
+                  className="mt-3 block w-full max-w-full"
+                />
+                {audioMessage && (
+                  <p
+                    role="status"
+                    className="mt-2 text-[12px] text-[var(--aive-danger)]"
+                  >
+                    {audioMessage}
+                  </p>
+                )}
+              </div>
+            )}
+
             {/* 개인정보 표시 마스킹 */}
             <div className="mb-4 flex flex-col gap-3 rounded-xl border border-[var(--aive-line)] bg-white p-3 sm:flex-row sm:items-center sm:justify-between">
               <div>
@@ -784,14 +990,26 @@ export default function Home() {
             {/* 대화 목록 — VITO처럼 메신저 형태로 */}
             <ol className="space-y-3">
               {visibleUtterances.map(
-                ({ utterance: u, displayMessage }, idx) => {
+                ({ utterance: u, utteranceIndex, displayMessage }) => {
                   const isSpeakerZero = u.spk === 0;
+                  const isActive = utteranceIndex === activeUtteranceIndex;
 
                   return (
                     <li
-                      key={`${u.start_at}-${idx}`}
+                      key={`${u.start_at}-${utteranceIndex}`}
+                      ref={(element) => {
+                        if (element) {
+                          utteranceElementRefs.current.set(
+                            utteranceIndex,
+                            element,
+                          );
+                        } else {
+                          utteranceElementRefs.current.delete(utteranceIndex);
+                        }
+                      }}
+                      aria-current={isActive ? "true" : undefined}
                       className={[
-                        "flex flex-col",
+                        "scroll-mt-28 flex flex-col",
                         isSpeakerZero ? "items-start" : "items-end",
                       ].join(" ")}
                     >
@@ -811,9 +1029,14 @@ export default function Home() {
                         >
                           화자 {u.spk}
                         </span>
-                        <time className="tabular-nums text-[var(--aive-mute)]">
+                        <button
+                          type="button"
+                          onClick={() => playAudioFrom(u.start_at)}
+                          aria-label={`${formatTimestamp(u.start_at)}부터 재생`}
+                          className="rounded tabular-nums text-[var(--aive-mute)] underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
+                        >
                           {formatTimestamp(u.start_at)}
-                        </time>
+                        </button>
                       </div>
                       <p
                         className={[
@@ -821,6 +1044,9 @@ export default function Home() {
                           isSpeakerZero
                             ? "rounded-tl-md bg-[var(--aive-surface)] text-[var(--aive-ink)]"
                             : "rounded-tr-md bg-[var(--aive-accent)] text-white",
+                          isActive
+                            ? "ring-2 ring-[var(--aive-accent)] ring-offset-2 shadow-[0_4px_14px_rgba(59,91,219,0.18)]"
+                            : "",
                         ].join(" ")}
                       >
                         {highlightSearchTerm(displayMessage, searchTerm)}
