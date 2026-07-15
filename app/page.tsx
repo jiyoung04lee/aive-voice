@@ -13,7 +13,13 @@
  * 색상은 globals.css의 CSS 변수로 관리 (--aive-accent 하나만 바꾸면 브랜드 컬러 교체)
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 type Utterance = {
   start_at: number;
@@ -28,12 +34,68 @@ type Phase = "idle" | "uploading" | "transcribing" | "completed" | "failed";
 const ACCEPTED_EXTENSIONS = [".m4a", ".mp3", ".wav"];
 const POLL_INTERVAL_MS = 5000; // RTZR 권장 폴링 주기
 const POLL_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_KEYWORD_COUNT = 500;
+const MAX_KEYWORD_LENGTH = 20;
+const COMPLETE_HANGUL_SYLLABLE_PATTERN = /^[\uAC00-\uD7A3]+$/u;
 
 function formatTimestamp(ms: number): string {
   const totalSeconds = Math.floor(ms / 1000);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function highlightSearchTerm(text: string, searchTerm: string): ReactNode {
+  const normalizedSearchTerm = searchTerm.trim();
+
+  if (normalizedSearchTerm === "") {
+    return text;
+  }
+
+  const pattern = new RegExp(escapeRegExp(normalizedSearchTerm), "giu");
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+
+  for (const match of text.matchAll(pattern)) {
+    const matchIndex = match.index ?? 0;
+
+    if (matchIndex > lastIndex) {
+      nodes.push(text.slice(lastIndex, matchIndex));
+    }
+
+    nodes.push(
+      <mark
+        key={`${matchIndex}-${nodes.length}`}
+        className="rounded-sm bg-yellow-200 px-0.5 text-[var(--aive-ink)]"
+      >
+        {match[0]}
+      </mark>,
+    );
+    lastIndex = matchIndex + match[0].length;
+  }
+
+  if (nodes.length === 0) {
+    return text;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+
+  return nodes;
+}
+
+function buildTranscriptText(utterances: readonly Utterance[]): string {
+  const utteranceBlocks = utterances.map(
+    (utterance) =>
+      `[${formatTimestamp(utterance.start_at)}] 화자 ${utterance.spk}\n${utterance.msg}`,
+  );
+
+  return ["AIVE Voice 전사 결과", ...utteranceBlocks].join("\n\n");
 }
 
 function formatFileSize(bytes: number): string {
@@ -44,6 +106,39 @@ function formatFileSize(bytes: number): string {
 function isSupportedFile(name: string): boolean {
   const lower = name.toLowerCase();
   return ACCEPTED_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+function normalizeKeywords(input: string): string[] {
+  const keywords = input
+    .split(",")
+    .map((keyword) => keyword.trim())
+    .filter((keyword) => keyword.length > 0);
+
+  return Array.from(new Set(keywords));
+}
+
+function validateKeywords(keywords: readonly string[]): string | null {
+  if (keywords.length > MAX_KEYWORD_COUNT) {
+    return "키워드는 최대 500개까지 입력할 수 있습니다.";
+  }
+
+  if (
+    keywords.some(
+      (keyword) => Array.from(keyword).length > MAX_KEYWORD_LENGTH,
+    )
+  ) {
+    return "키워드는 각각 20자 이하로 입력해주세요.";
+  }
+
+  if (
+    keywords.some(
+      (keyword) => !COMPLETE_HANGUL_SYLLABLE_PATTERN.test(keyword),
+    )
+  ) {
+    return "키워드는 한글로만 입력해주세요.";
+  }
+
+  return null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -90,6 +185,8 @@ export default function Home() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [pollCount, setPollCount] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
+  const [keywordInput, setKeywordInput] = useState("");
+  const [searchInput, setSearchInput] = useState("");
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -196,14 +293,30 @@ export default function Home() {
       setErrorMessage("먼저 음성 파일을 선택해주세요.");
       return;
     }
+
+    const keywords = normalizeKeywords(keywordInput);
+    const keywordError = validateKeywords(keywords);
+
+    if (keywordError) {
+      setPhase("idle");
+      setErrorMessage(keywordError);
+      return;
+    }
+
     setErrorMessage(null);
     setUtterances([]);
     setPollCount(0);
+    setSearchInput("");
     setPhase("uploading");
 
     try {
       const formData = new FormData();
       formData.append("file", file);
+
+      if (keywords.length > 0) {
+        formData.append("keywords", JSON.stringify(keywords));
+      }
+
       const res = await fetch("/api/transcriptions", {
         method: "POST",
         body: formData,
@@ -241,8 +354,34 @@ export default function Home() {
     setErrorMessage(null);
     setPollCount(0);
     setIsDragging(false);
+    setKeywordInput("");
+    setSearchInput("");
     pollStartRef.current = 0;
     if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const downloadTranscript = () => {
+    if (utterances.length === 0) {
+      return;
+    }
+
+    const transcriptText = buildTranscriptText(utterances);
+    const blob = new Blob([`\uFEFF${transcriptText}`], {
+      type: "text/plain;charset=utf-8",
+    });
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+
+    anchor.href = objectUrl;
+    anchor.download = "aive-voice-transcript.txt";
+
+    try {
+      document.body.appendChild(anchor);
+      anchor.click();
+    } finally {
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+    }
   };
 
   const speakerIds = Array.from(new Set(utterances.map((u) => u.spk))).sort(
@@ -255,6 +394,14 @@ export default function Home() {
         utterances[utterances.length - 1].duration
       : 0;
   const isBusy = phase === "uploading" || phase === "transcribing";
+  const searchTerm = searchInput.trim();
+  const normalizedSearchTerm = searchTerm.toLowerCase();
+  const visibleUtterances =
+    normalizedSearchTerm === ""
+      ? utterances
+      : utterances.filter((utterance) =>
+          utterance.msg.toLowerCase().includes(normalizedSearchTerm),
+        );
 
   return (
     <div className="min-h-screen bg-[var(--aive-canvas)] font-sans text-[var(--aive-ink)] antialiased">
@@ -396,6 +543,39 @@ export default function Home() {
             </div>
           )}
 
+          {/* 키워드 부스팅 */}
+          <div className="mt-5 border-t border-[var(--aive-line)] pt-5">
+            <label
+              htmlFor="transcription-keywords"
+              className="block text-[14px] font-semibold text-[var(--aive-ink)]"
+            >
+              인식할 주요 용어
+            </label>
+            <p
+              id="transcription-keywords-description"
+              className="mt-1 text-[13px] leading-relaxed text-[var(--aive-mute)]"
+            >
+              회사명, 직무명처럼 정확히 인식해야 하는 단어를 쉼표로 구분해
+              입력해주세요.
+            </p>
+            <input
+              id="transcription-keywords"
+              type="text"
+              value={keywordInput}
+              onChange={(event) => setKeywordInput(event.target.value)}
+              disabled={isBusy}
+              aria-describedby="transcription-keywords-description transcription-keywords-help"
+              placeholder="현대오토에버, 프론트엔드, 카카오뱅크, 커피챗"
+              className="mt-3 w-full rounded-xl border border-[var(--aive-line)] bg-white px-4 py-3 text-[14px] text-[var(--aive-ink)] outline-none transition placeholder:text-[var(--aive-mute)] focus:border-[var(--aive-accent)] focus:ring-2 focus:ring-[var(--aive-accent-soft)] disabled:cursor-not-allowed disabled:bg-[var(--aive-surface)] disabled:text-[var(--aive-mute)]"
+            />
+            <p
+              id="transcription-keywords-help"
+              className="mt-2 text-[12px] text-[var(--aive-mute)]"
+            >
+              선택 입력 · 한글 단어만 가능 · 키워드당 최대 20자
+            </p>
+          </div>
+
           {/* 전사 시작 버튼 */}
           <button
             type="button"
@@ -492,13 +672,48 @@ export default function Home() {
               <span>발화 {utterances.length}개</span>
               <span>화자 {speakerCount}명</span>
               <span>길이 {formatTimestamp(totalDurationMs)}</span>
-              <button
-                type="button"
-                onClick={reset}
-                className="ml-auto font-medium text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
-              >
-                새 인터뷰 전사
-              </button>
+              <div className="ml-auto flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={downloadTranscript}
+                  disabled={utterances.length === 0}
+                  className="font-medium text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)] disabled:cursor-not-allowed disabled:text-[var(--aive-mute)] disabled:no-underline"
+                >
+                  TXT 다운로드
+                </button>
+                <button
+                  type="button"
+                  onClick={reset}
+                  className="font-medium text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
+                >
+                  새 인터뷰 전사
+                </button>
+              </div>
+            </div>
+
+            {/* 전사문 검색 */}
+            <div className="mb-4 rounded-xl border border-[var(--aive-line)] bg-white p-3">
+              <label htmlFor="transcript-search" className="sr-only">
+                전사 내용 검색
+              </label>
+              <input
+                id="transcript-search"
+                type="search"
+                value={searchInput}
+                onChange={(event) => setSearchInput(event.target.value)}
+                placeholder="전사 내용 검색"
+                className="w-full rounded-lg border border-[var(--aive-line)] bg-white px-3.5 py-2.5 text-[14px] text-[var(--aive-ink)] outline-none transition placeholder:text-[var(--aive-mute)] focus:border-[var(--aive-accent)] focus:ring-2 focus:ring-[var(--aive-accent-soft)]"
+              />
+              {searchTerm !== "" && (
+                <p
+                  aria-live="polite"
+                  className="mt-2 px-1 text-[12px] font-medium text-[var(--aive-mute)]"
+                >
+                  {visibleUtterances.length > 0
+                    ? `검색 결과 ${visibleUtterances.length}건`
+                    : "검색 결과가 없습니다."}
+                </p>
+              )}
             </div>
 
             {/* 화자 범례 */}
@@ -520,7 +735,7 @@ export default function Home() {
 
             {/* 대화 목록 — VITO처럼 메신저 형태로 */}
             <ol className="space-y-3">
-              {utterances.map((u, idx) => {
+              {visibleUtterances.map((u, idx) => {
                 const isSpeakerZero = u.spk === 0;
                 return (
                   <li
@@ -558,7 +773,7 @@ export default function Home() {
                           : "rounded-tr-md bg-[var(--aive-accent)] text-white",
                       ].join(" ")}
                     >
-                      {u.msg}
+                      {highlightSearchTerm(u.msg, searchTerm)}
                     </p>
                   </li>
                 );
@@ -571,13 +786,23 @@ export default function Home() {
           <section className="mt-8" aria-label="빈 전사 결과">
             <div className="flex flex-wrap items-center gap-3 rounded-xl bg-[var(--aive-surface)] px-4 py-4 text-[13px] text-[var(--aive-mute)]">
               <p>전사는 완료되었지만 표시할 발화 내용이 없습니다.</p>
-              <button
-                type="button"
-                onClick={reset}
-                className="ml-auto font-medium text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
-              >
-                새 인터뷰 전사
-              </button>
+              <div className="ml-auto flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={downloadTranscript}
+                  disabled
+                  className="cursor-not-allowed font-medium text-[var(--aive-mute)]"
+                >
+                  TXT 다운로드
+                </button>
+                <button
+                  type="button"
+                  onClick={reset}
+                  className="font-medium text-[var(--aive-accent)] hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--aive-accent)]"
+                >
+                  새 인터뷰 전사
+                </button>
+              </div>
             </div>
           </section>
         )}

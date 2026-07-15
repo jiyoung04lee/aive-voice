@@ -17,6 +17,7 @@ interface RtzrFileTranscriptionConfig {
     max: number;
   };
   domain: "GENERAL";
+  keywords?: string[];
 }
 
 const config: RtzrFileTranscriptionConfig = {
@@ -304,15 +305,17 @@ export async function authenticateRtzr(): Promise<RtzrAuthToken> {
 
 export async function createRtzrTranscription(
   file: File,
+  keywords?: readonly string[],
 ): Promise<RtzrTranscriptionJob> {
   const { access_token: accessToken } = await authenticateRtzr();
   const requestBody = new FormData();
+  const transcriptionConfig: RtzrFileTranscriptionConfig =
+    keywords && keywords.length > 0
+      ? { ...config, keywords: [...keywords] }
+      : config;
 
   requestBody.append("file", file);
-  requestBody.append(
-    "config",
-    JSON.stringify(config),
-  );
+  requestBody.append("config", JSON.stringify(transcriptionConfig));
 
   const response = await fetch(RTZR_TRANSCRIBE_URL, {
     method: "POST",
